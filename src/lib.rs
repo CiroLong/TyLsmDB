@@ -8,6 +8,7 @@ pub mod error;
 pub mod iterator;
 pub mod key;
 pub mod memtable;
+pub mod mvcc;
 pub mod options;
 pub mod snapshot;
 pub mod table;

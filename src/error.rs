@@ -7,6 +7,7 @@ pub enum Error {
     Io(std::io::Error),
     Closed,
     Unsupported(&'static str),
+    TransactionConflict(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -19,6 +20,7 @@ impl Display for Error {
             Self::Io(err) => write!(f, "io error: {err}"),
             Self::Closed => write!(f, "database is closed"),
             Self::Unsupported(feature) => write!(f, "unsupported feature: {feature}"),
+            Self::TransactionConflict(msg) => write!(f, "transaction conflict: {msg}"),
         }
     }
 }

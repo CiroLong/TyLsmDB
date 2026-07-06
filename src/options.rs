@@ -1,3 +1,5 @@
+use crate::snapshot::Snapshot;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalSyncMode {
     Never,
@@ -64,6 +66,7 @@ pub struct ReadOptions {
     pub verify_checksums: bool,
     pub fill_cache: bool,
     pub total_order_seek: bool,
+    pub snapshot: Option<Snapshot>,
 }
 
 impl Default for ReadOptions {
@@ -72,6 +75,7 @@ impl Default for ReadOptions {
             verify_checksums: true,
             fill_cache: true,
             total_order_seek: false,
+            snapshot: None,
         }
     }
 }

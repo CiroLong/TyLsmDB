@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::mem;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -16,6 +17,8 @@ use crate::error::{Error, Result};
 use crate::iterator::{DBIterator, EntryIterator, MergeIterator, StorageIterator};
 use crate::key::{InternalKey, SequenceNumber};
 use crate::memtable::{MemTable, ValueRecord};
+use crate::mvcc::conflict::ReadRange;
+use crate::mvcc::watermark::Watermark;
 use crate::options::{Options, ReadOptions, WalSyncMode, WriteOptions};
 use crate::snapshot::Snapshot;
 use crate::table::{SSTableBuilder, SSTableReader};
@@ -36,6 +39,7 @@ struct DBInner {
     versions: Mutex<VersionSet>,
     block_cache: BlockCache,
     table_cache: TableCache,
+    watermark: Arc<Watermark>,
     wal: Mutex<WalWriter>,
 }
 
@@ -82,6 +86,7 @@ impl DB {
         };
         let block_cache = BlockCache::new(options.block_cache_capacity);
         let table_cache = TableCache::new(512);
+        let watermark = Arc::new(Watermark::new());
         let (l0_tables, level_tables) =
             open_version_tables(&path, versions.current().as_ref(), &table_cache)?;
         let mut state = DBState {
@@ -106,6 +111,7 @@ impl DB {
                 versions: Mutex::new(versions),
                 block_cache,
                 table_cache,
+                watermark,
                 wal: Mutex::new(wal),
             }),
         })
@@ -176,23 +182,29 @@ impl DB {
     }
 
     pub fn get_opt(&self, key: &[u8], opts: ReadOptions) -> Result<Option<Bytes>> {
-        let (read_seq, l0_tables, level_tables) = {
+        let (read_seq, fill_cache, l0_tables, level_tables) = {
             let state = self.read_state()?;
             if state.closed {
                 return Err(Error::Closed);
             }
+            let read_seq = opts
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.read_seq())
+                .unwrap_or(state.last_sequence);
 
-            if let Some(record) = state.mutable.get(key, state.last_sequence) {
+            if let Some(record) = state.mutable.get(key, read_seq) {
                 return Ok(record.into_visible_value());
             }
             for memtable in state.immutables.iter().rev() {
-                if let Some(record) = memtable.get(key, state.last_sequence) {
+                if let Some(record) = memtable.get(key, read_seq) {
                     return Ok(record.into_visible_value());
                 }
             }
 
             (
-                state.last_sequence,
+                read_seq,
+                opts.fill_cache,
                 state.l0_tables.clone(),
                 state.level_tables.clone(),
             )
@@ -207,7 +219,7 @@ impl DB {
                 read_seq,
                 meta.number,
                 Some(&self.inner.block_cache),
-                opts.fill_cache,
+                fill_cache,
             )? {
                 return Ok(record.into_visible_value());
             }
@@ -225,7 +237,7 @@ impl DB {
                 read_seq,
                 meta.number,
                 Some(&self.inner.block_cache),
-                opts.fill_cache,
+                fill_cache,
             )? {
                 return Ok(record.into_visible_value());
             }
@@ -234,18 +246,32 @@ impl DB {
     }
 
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<Vec<(Bytes, Bytes)>> {
+        self.scan_opt(lower, upper, ReadOptions::default())
+    }
+
+    pub fn scan_opt(
+        &self,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        opts: ReadOptions,
+    ) -> Result<Vec<(Bytes, Bytes)>> {
         let (read_seq, mem_entries, l0_tables, level_tables) = {
             let state = self.read_state()?;
             if state.closed {
                 return Err(Error::Closed);
             }
+            let read_seq = opts
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.read_seq())
+                .unwrap_or(state.last_sequence);
             let mut entries = Vec::new();
             extend_memtable_entries(&mut entries, &state.mutable);
             for memtable in state.immutables.iter().rev() {
                 extend_memtable_entries(&mut entries, memtable);
             }
             (
-                state.last_sequence,
+                read_seq,
                 entries,
                 state.l0_tables.clone(),
                 state.level_tables.clone(),
@@ -280,12 +306,67 @@ impl DB {
 
     pub fn snapshot(&self) -> Snapshot {
         self.read_state()
-            .map(|state| Snapshot::new(state.last_sequence))
-            .unwrap_or_else(|_| Snapshot::new(0))
+            .map(|state| Snapshot::new(state.last_sequence, Arc::clone(&self.inner.watermark)))
+            .unwrap_or_else(|_| Snapshot::new(0, Arc::clone(&self.inner.watermark)))
     }
 
-    pub fn transaction(&self, _opts: TransactionOptions) -> Result<Transaction> {
-        Err(Error::Unsupported("transactions arrive in V7"))
+    pub fn transaction(&self, opts: TransactionOptions) -> Result<Transaction> {
+        let snapshot = {
+            let state = self.read_state()?;
+            if state.closed {
+                return Err(Error::Closed);
+            }
+            Snapshot::new(state.last_sequence, Arc::clone(&self.inner.watermark))
+        };
+        Ok(Transaction::new(self.clone(), snapshot, opts))
+    }
+
+    pub(crate) fn commit_transaction(
+        &self,
+        read_seq: SequenceNumber,
+        batch: WriteBatch,
+        read_keys: &BTreeSet<Bytes>,
+        read_ranges: &[ReadRange],
+    ) -> Result<()> {
+        let write_keys = batch_write_keys(&batch);
+        self.apply_write_pressure()?;
+
+        let should_flush = {
+            let mut state = self.write_state()?;
+            if state.closed {
+                return Err(Error::Closed);
+            }
+
+            self.ensure_no_transaction_conflicts(
+                &state,
+                read_seq,
+                read_keys,
+                read_ranges,
+                &write_keys,
+            )?;
+            if batch.is_empty() {
+                return Ok(());
+            }
+
+            let start_sequence = state.last_sequence + 1;
+            if self.inner.options.wal_enabled {
+                let payload = batch.encode_with_sequence(start_sequence);
+                let mut wal = self.write_wal()?;
+                wal.append(&payload)?;
+                if self.inner.options.wal_sync == WalSyncMode::PerWrite {
+                    wal.sync()?;
+                }
+            }
+
+            apply_batch(&mut state, start_sequence, &batch);
+            freeze_mutable_if_needed(&mut state, self.inner.options.memtable_size)
+        };
+
+        if should_flush {
+            self.flush()?;
+        }
+
+        Ok(())
     }
 
     pub fn flush(&self) -> Result<()> {
@@ -378,6 +459,111 @@ impl DB {
             .map_err(|_| Error::Corruption("version set lock poisoned".to_string()))
     }
 
+    fn ensure_no_transaction_conflicts(
+        &self,
+        state: &DBState,
+        read_seq: SequenceNumber,
+        read_keys: &BTreeSet<Bytes>,
+        read_ranges: &[ReadRange],
+        write_keys: &BTreeSet<Bytes>,
+    ) -> Result<()> {
+        for key in read_keys {
+            if self.key_changed_after(state, key, read_seq)? {
+                return Err(Error::TransactionConflict(format!(
+                    "read key changed after snapshot: {}",
+                    String::from_utf8_lossy(key)
+                )));
+            }
+        }
+
+        for key in write_keys {
+            if self.key_changed_after(state, key, read_seq)? {
+                return Err(Error::TransactionConflict(format!(
+                    "write key changed after snapshot: {}",
+                    String::from_utf8_lossy(key)
+                )));
+            }
+        }
+
+        for (lower, upper) in read_ranges {
+            if self.range_changed_after(state, lower, upper, read_seq)? {
+                return Err(Error::TransactionConflict(
+                    "scanned range changed after snapshot".to_string(),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn key_changed_after(
+        &self,
+        state: &DBState,
+        user_key: &[u8],
+        read_seq: SequenceNumber,
+    ) -> Result<bool> {
+        self.any_entry_after(state, read_seq, |key| key.user_key() == user_key)
+    }
+
+    fn range_changed_after(
+        &self,
+        state: &DBState,
+        lower: &Bound<Bytes>,
+        upper: &Bound<Bytes>,
+        read_seq: SequenceNumber,
+    ) -> Result<bool> {
+        self.any_entry_after(state, read_seq, |key| {
+            within_owned_bounds(key.user_key(), lower, upper)
+        })
+    }
+
+    fn any_entry_after(
+        &self,
+        state: &DBState,
+        read_seq: SequenceNumber,
+        mut predicate: impl FnMut(&InternalKey) -> bool,
+    ) -> Result<bool> {
+        for (key, _) in state.mutable.entries() {
+            if key.sequence() > read_seq && predicate(key) {
+                return Ok(true);
+            }
+        }
+        for memtable in &state.immutables {
+            for (key, _) in memtable.entries() {
+                if key.sequence() > read_seq && predicate(key) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        for (meta, table) in &state.l0_tables {
+            if meta.largest_seq <= read_seq {
+                continue;
+            }
+            for (key, _) in table.entries_with_cache(meta.number, Some(&self.inner.block_cache))? {
+                if key.sequence() > read_seq && predicate(&key) {
+                    return Ok(true);
+                }
+            }
+        }
+        for level in &state.level_tables {
+            for (meta, table) in level {
+                if meta.largest_seq <= read_seq {
+                    continue;
+                }
+                for (key, _) in
+                    table.entries_with_cache(meta.number, Some(&self.inner.block_cache))?
+                {
+                    if key.sequence() > read_seq && predicate(&key) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+
+        Ok(false)
+    }
+
     fn allocate_file_number(&self) -> Result<u64> {
         Ok(self.write_versions()?.allocate_file_number())
     }
@@ -447,7 +633,13 @@ impl DB {
             return Ok(false);
         }
 
-        if task.is_trivial_move() {
+        let gc_watermark = self
+            .inner
+            .watermark
+            .oldest()
+            .unwrap_or(self.read_state()?.last_sequence);
+
+        if task.is_trivial_move() && !self.trivial_move_needs_rewrite(&task, gc_watermark)? {
             let meta = task.input_files[0].clone();
             {
                 let mut versions = self.write_versions()?;
@@ -464,7 +656,6 @@ impl DB {
             return Ok(true);
         }
 
-        let read_seq = self.read_state()?.last_sequence;
         let mut entries = Vec::new();
         for file in task.all_input_files() {
             let table = self.inner.table_cache.get_or_open(
@@ -474,7 +665,7 @@ impl DB {
             entries.extend(table.entries_with_cache(file.number, Some(&self.inner.block_cache))?);
         }
 
-        let output_entries = compact_entries(entries, read_seq);
+        let output_entries = compact_entries(entries, gc_watermark);
         let output = if output_entries.is_empty() {
             None
         } else {
@@ -510,6 +701,21 @@ impl DB {
         self.refresh_tables_from_version()?;
         self.delete_obsolete_files(task.all_input_files().map(|file| file.number))?;
         Ok(true)
+    }
+
+    fn trivial_move_needs_rewrite(
+        &self,
+        task: &CompactionTask,
+        gc_watermark: SequenceNumber,
+    ) -> Result<bool> {
+        let file = &task.input_files[0];
+        let table = self.inner.table_cache.get_or_open(
+            file.number,
+            &self.inner.path.join(table_file_name(file.number)),
+        )?;
+        let entries = table.entries_with_cache(file.number, Some(&self.inner.block_cache))?;
+        let compacted_entries = compact_entries(entries.clone(), gc_watermark);
+        Ok(compacted_entries.len() != entries.len())
     }
 
     fn write_compaction_output(
@@ -696,6 +902,30 @@ fn clone_bound_ref<'a>(bound: &Bound<&'a [u8]>) -> Bound<&'a [u8]> {
         Bound::Excluded(value) => Bound::Excluded(*value),
         Bound::Unbounded => Bound::Unbounded,
     }
+}
+
+fn within_owned_bounds(key: &[u8], lower: &Bound<Bytes>, upper: &Bound<Bytes>) -> bool {
+    let lower_ok = match lower {
+        Bound::Included(bound) => key >= bound.as_slice(),
+        Bound::Excluded(bound) => key > bound.as_slice(),
+        Bound::Unbounded => true,
+    };
+    let upper_ok = match upper {
+        Bound::Included(bound) => key <= bound.as_slice(),
+        Bound::Excluded(bound) => key < bound.as_slice(),
+        Bound::Unbounded => true,
+    };
+    lower_ok && upper_ok
+}
+
+fn batch_write_keys(batch: &WriteBatch) -> BTreeSet<Bytes> {
+    batch
+        .records()
+        .iter()
+        .map(|record| match record {
+            BatchRecord::Put { key, .. } | BatchRecord::Delete { key } => key.clone(),
+        })
+        .collect()
 }
 
 fn apply_batch(state: &mut DBState, start_sequence: SequenceNumber, batch: &WriteBatch) {

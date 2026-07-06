@@ -5,17 +5,19 @@ use crate::memtable::ValueRecord;
 
 pub fn compact_entries(
     mut entries: Vec<(InternalKey, ValueRecord)>,
-    read_seq: SequenceNumber,
+    gc_watermark: SequenceNumber,
 ) -> Vec<(InternalKey, ValueRecord)> {
     entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
-    let mut seen = BTreeSet::new();
+    let mut seen_below_watermark = BTreeSet::new();
     let mut output = Vec::new();
     for (key, value) in entries {
-        if key.sequence() > read_seq {
+        if key.sequence() > gc_watermark {
+            output.push((key, value));
             continue;
         }
-        if !seen.insert(key.user_key().to_vec()) {
+
+        if !seen_below_watermark.insert(key.user_key().to_vec()) {
             continue;
         }
         if let ValueRecord::Put(_) = value {
