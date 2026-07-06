@@ -2,10 +2,15 @@ use std::mem;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
+use std::time::Duration;
 
 use crate::batch::{BatchRecord, WriteBatch};
 use crate::bytes::Bytes;
 use crate::cache::{BlockCache, CacheStats, TableCache};
+use crate::compact::executor::compact_entries;
+use crate::compact::picker::CompactionPicker;
+use crate::compact::task::CompactionTask;
 use crate::env::file::{table_file_name, wal_file_name};
 use crate::error::{Error, Result};
 use crate::iterator::{DBIterator, EntryIterator, MergeIterator, StorageIterator};
@@ -136,6 +141,8 @@ impl DB {
         if batch.is_empty() {
             return Ok(());
         }
+
+        self.apply_write_pressure()?;
 
         let should_flush = {
             let mut state = self.write_state()?;
@@ -305,8 +312,21 @@ impl DB {
         }
     }
 
-    pub fn compact_range(&self, _lower: Bound<&[u8]>, _upper: Bound<&[u8]>) -> Result<()> {
-        Err(Error::Unsupported("compaction arrives in V6"))
+    pub fn compact_range(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<()> {
+        let task = {
+            let versions = self.write_versions()?;
+            let picker = CompactionPicker::new(self.inner.options.clone());
+            picker.pick_manual(
+                versions.current().as_ref(),
+                clone_bound_ref(&lower),
+                clone_bound_ref(&upper),
+            )
+        };
+
+        if let Some(task) = task {
+            self.execute_compaction(task)?;
+        }
+        Ok(())
     }
 
     pub fn sync_wal(&self) -> Result<()> {
@@ -315,6 +335,19 @@ impl DB {
 
     pub fn block_cache_stats(&self) -> CacheStats {
         self.inner.block_cache.stats()
+    }
+
+    pub fn level_file_counts(&self) -> Vec<usize> {
+        self.read_state()
+            .map(|state| {
+                let mut counts = Vec::with_capacity(state.level_tables.len().max(1));
+                counts.push(state.l0_tables.len());
+                for level in state.level_tables.iter().skip(1) {
+                    counts.push(level.len());
+                }
+                counts
+            })
+            .unwrap_or_default()
     }
 
     fn read_state(&self) -> Result<std::sync::RwLockReadGuard<'_, DBState>> {
@@ -392,6 +425,135 @@ impl DB {
         };
 
         *self.write_wal()? = new_wal;
+        Ok(())
+    }
+
+    fn apply_write_pressure(&self) -> Result<()> {
+        let l0_count = self
+            .read_state()
+            .map(|state| state.l0_tables.len())
+            .unwrap_or_default();
+
+        if l0_count >= self.inner.options.level0_stop_writes_trigger {
+            self.compact_range(Bound::Unbounded, Bound::Unbounded)?;
+        } else if l0_count >= self.inner.options.level0_slowdown_writes_trigger {
+            thread::sleep(Duration::from_millis(5));
+        }
+        Ok(())
+    }
+
+    fn execute_compaction(&self, task: CompactionTask) -> Result<bool> {
+        if task.input_files.is_empty() {
+            return Ok(false);
+        }
+
+        if task.is_trivial_move() {
+            let meta = task.input_files[0].clone();
+            {
+                let mut versions = self.write_versions()?;
+                versions.log_and_apply(VersionEdit::DeleteFile {
+                    level: task.input_level,
+                    number: meta.number,
+                })?;
+                versions.log_and_apply(VersionEdit::AddFile {
+                    level: task.output_level,
+                    meta,
+                })?;
+            }
+            self.refresh_tables_from_version()?;
+            return Ok(true);
+        }
+
+        let read_seq = self.read_state()?.last_sequence;
+        let mut entries = Vec::new();
+        for file in task.all_input_files() {
+            let table = self.inner.table_cache.get_or_open(
+                file.number,
+                &self.inner.path.join(table_file_name(file.number)),
+            )?;
+            entries.extend(table.entries_with_cache(file.number, Some(&self.inner.block_cache))?);
+        }
+
+        let output_entries = compact_entries(entries, read_seq);
+        let output = if output_entries.is_empty() {
+            None
+        } else {
+            let number = self.allocate_file_number()?;
+            Some(self.write_compaction_output(number, output_entries)?)
+        };
+
+        {
+            let mut versions = self.write_versions()?;
+            for file in task.all_input_files() {
+                let level = if task
+                    .input_files
+                    .iter()
+                    .any(|input| input.number == file.number)
+                {
+                    task.input_level
+                } else {
+                    task.output_level
+                };
+                versions.log_and_apply(VersionEdit::DeleteFile {
+                    level,
+                    number: file.number,
+                })?;
+            }
+            if let Some((_, meta)) = &output {
+                versions.log_and_apply(VersionEdit::AddFile {
+                    level: task.output_level,
+                    meta: meta.clone(),
+                })?;
+            }
+        }
+
+        self.refresh_tables_from_version()?;
+        self.delete_obsolete_files(task.all_input_files().map(|file| file.number))?;
+        Ok(true)
+    }
+
+    fn write_compaction_output(
+        &self,
+        file_number: u64,
+        entries: Vec<(InternalKey, ValueRecord)>,
+    ) -> Result<(Arc<SSTableReader>, FileMeta)> {
+        let table_name = table_file_name(file_number);
+        let tmp_path = self.inner.path.join(format!("{table_name}.tmp"));
+        let final_path = self.inner.path.join(table_name);
+        let mut builder = SSTableBuilder::create(&tmp_path, self.inner.options.block_size)?;
+        for (key, value) in entries {
+            builder.add(key, &value)?;
+        }
+        builder.finish()?;
+        std::fs::rename(&tmp_path, &final_path)?;
+        let file_size = std::fs::metadata(&final_path)?.len();
+        let reader = self
+            .inner
+            .table_cache
+            .get_or_open(file_number, &final_path)?;
+        let meta = file_meta_from_table(file_number, file_size, &reader)?;
+        Ok((reader, meta))
+    }
+
+    fn refresh_tables_from_version(&self) -> Result<()> {
+        let current = self.write_versions()?.current();
+        let (l0_tables, level_tables) =
+            open_version_tables(&self.inner.path, current.as_ref(), &self.inner.table_cache)?;
+        let mut state = self.write_state()?;
+        state.l0_tables = l0_tables;
+        state.level_tables = level_tables;
+        Ok(())
+    }
+
+    fn delete_obsolete_files(&self, numbers: impl IntoIterator<Item = u64>) -> Result<()> {
+        for number in numbers {
+            let path = self.inner.path.join(table_file_name(number));
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
+        }
         Ok(())
     }
 }
@@ -524,6 +686,14 @@ fn bound_to_owned(bound: Bound<&[u8]>) -> Bound<Bytes> {
     match bound {
         Bound::Included(value) => Bound::Included(value.to_vec()),
         Bound::Excluded(value) => Bound::Excluded(value.to_vec()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+fn clone_bound_ref<'a>(bound: &Bound<&'a [u8]>) -> Bound<&'a [u8]> {
+    match bound {
+        Bound::Included(value) => Bound::Included(*value),
+        Bound::Excluded(value) => Bound::Excluded(*value),
         Bound::Unbounded => Bound::Unbounded,
     }
 }

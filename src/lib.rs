@@ -1,6 +1,7 @@
 pub mod batch;
 pub mod bytes;
 pub mod cache;
+pub mod compact;
 pub mod db;
 pub mod env;
 pub mod error;
