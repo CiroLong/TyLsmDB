@@ -6,6 +6,7 @@ use crate::error::Result;
 use crate::key::InternalKey;
 use crate::memtable::ValueRecord;
 use crate::table::block_builder::BlockBuilder;
+use crate::table::filter::TableFilter;
 use crate::table::format::{
     BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, encode_footer, encode_internal_key,
 };
@@ -24,6 +25,7 @@ pub struct SSTableBuilder {
     index_entries: Vec<IndexEntry>,
     smallest_key: Option<InternalKey>,
     largest_key: Option<InternalKey>,
+    filter_keys: Vec<Vec<u8>>,
     num_entries: u64,
 }
 
@@ -52,6 +54,7 @@ impl SSTableBuilder {
             index_entries: Vec::new(),
             smallest_key: None,
             largest_key: None,
+            filter_keys: Vec::new(),
             num_entries: 0,
         })
     }
@@ -64,6 +67,7 @@ impl SSTableBuilder {
             self.smallest_key = Some(key.clone());
         }
         self.largest_key = Some(key.clone());
+        self.filter_keys.push(key.user_key().to_vec());
         self.current_block.add(key, value);
         self.num_entries += 1;
 
@@ -80,6 +84,7 @@ impl SSTableBuilder {
             num_entries: self.num_entries,
             smallest_key: self.smallest_key.clone(),
             largest_key: self.largest_key.clone(),
+            filter: TableFilter::from_keys(self.filter_keys.iter().map(Vec::as_slice)),
         };
         let properties_block = properties.encode();
         let properties_handle = self.write_block(&properties_block)?;

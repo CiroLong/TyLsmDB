@@ -1,12 +1,15 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::cache::BlockCache;
 use crate::error::{Error, Result};
 use crate::key::InternalKey;
 use crate::memtable::ValueRecord;
 use crate::table::block::Block;
 use crate::table::builder::IndexEntry;
+use crate::table::filter::TableFilter;
 use crate::table::format::{
     BLOCK_TRAILER_SIZE, BlockHandle, CompressionType, FOOTER_SIZE, decode_footer,
     decode_internal_key,
@@ -20,6 +23,7 @@ pub struct SSTableReader {
     path: PathBuf,
     index: Vec<IndexEntry>,
     properties: TableProperties,
+    filter: TableFilter,
 }
 
 impl SSTableReader {
@@ -43,14 +47,38 @@ impl SSTableReader {
         Ok(Self {
             path,
             index,
+            filter: TableFilter::decode(&properties.filter),
             properties,
         })
     }
 
     pub fn get(&self, user_key: &[u8], read_seq: u64) -> Result<Option<ValueRecord>> {
-        for (key, value) in self.entries()? {
-            if key.user_key() == user_key && key.sequence() <= read_seq {
-                return Ok(Some(value));
+        self.get_with_cache(user_key, read_seq, 0, None, false)
+    }
+
+    pub fn get_with_cache(
+        &self,
+        user_key: &[u8],
+        read_seq: u64,
+        table_number: u64,
+        block_cache: Option<&BlockCache>,
+        fill_cache: bool,
+    ) -> Result<Option<ValueRecord>> {
+        if !self.might_contain(user_key) {
+            return Ok(None);
+        }
+
+        let mut file = File::open(&self.path)?;
+        for index in &self.index {
+            if !index_may_contain_user_key(index, user_key) {
+                continue;
+            }
+            let block =
+                self.read_decoded_block(&mut file, index, table_number, block_cache, fill_cache)?;
+            for (key, value) in block.entries() {
+                if key.user_key() == user_key && key.sequence() <= read_seq {
+                    return Ok(Some(value.clone()));
+                }
             }
         }
         Ok(None)
@@ -71,14 +99,50 @@ impl SSTableReader {
         self.properties.largest_key.as_ref()
     }
 
+    pub fn might_contain(&self, user_key: &[u8]) -> bool {
+        self.filter.may_contain(user_key)
+    }
+
     pub(crate) fn entries(&self) -> Result<Vec<(InternalKey, ValueRecord)>> {
+        self.entries_with_cache(0, None)
+    }
+
+    pub(crate) fn entries_with_cache(
+        &self,
+        table_number: u64,
+        block_cache: Option<&BlockCache>,
+    ) -> Result<Vec<(InternalKey, ValueRecord)>> {
         let mut file = File::open(&self.path)?;
         let mut entries = Vec::new();
         for index in &self.index {
-            let block = read_block(&mut file, index.handle)?;
-            entries.extend_from_slice(Block::decode(&block)?.entries());
+            let block =
+                self.read_decoded_block(&mut file, index, table_number, block_cache, true)?;
+            entries.extend_from_slice(block.entries());
         }
         Ok(entries)
+    }
+
+    fn read_decoded_block(
+        &self,
+        file: &mut File,
+        index: &IndexEntry,
+        table_number: u64,
+        block_cache: Option<&BlockCache>,
+        fill_cache: bool,
+    ) -> Result<Arc<Block>> {
+        if fill_cache
+            && let Some(cache) = block_cache
+            && let Some(block) = cache.get(table_number, index.handle.offset)
+        {
+            return Ok(block);
+        }
+
+        let block_bytes = read_block(file, index.handle)?;
+        let block = Arc::new(Block::decode(&block_bytes)?);
+        if fill_cache && let Some(cache) = block_cache {
+            cache.insert(table_number, index.handle.offset, Arc::clone(&block));
+        }
+        Ok(block)
     }
 }
 
@@ -146,4 +210,8 @@ fn decode_index_entries(bytes: &[u8]) -> Result<Vec<IndexEntry>> {
         return Err(Error::Corruption("trailing index bytes".to_string()));
     }
     Ok(entries)
+}
+
+fn index_may_contain_user_key(index: &IndexEntry, user_key: &[u8]) -> bool {
+    user_key >= index.first_key.user_key() && user_key <= index.last_key.user_key()
 }

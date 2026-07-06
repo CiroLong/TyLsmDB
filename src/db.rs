@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::mem;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
@@ -6,15 +5,17 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::batch::{BatchRecord, WriteBatch};
 use crate::bytes::Bytes;
+use crate::cache::{BlockCache, CacheStats, TableCache};
 use crate::env::file::{table_file_name, wal_file_name};
 use crate::error::{Error, Result};
+use crate::iterator::{DBIterator, EntryIterator, MergeIterator, StorageIterator};
 use crate::key::{InternalKey, SequenceNumber};
 use crate::memtable::{MemTable, ValueRecord};
 use crate::options::{Options, ReadOptions, WalSyncMode, WriteOptions};
 use crate::snapshot::Snapshot;
 use crate::table::{SSTableBuilder, SSTableReader};
 use crate::transaction::{Transaction, TransactionOptions};
-use crate::version::{FileMeta, VersionEdit, VersionSet};
+use crate::version::{FileMeta, Version, VersionEdit, VersionSet};
 use crate::wal::{WalReader, WalWriter};
 
 #[derive(Debug, Clone)]
@@ -28,6 +29,8 @@ struct DBInner {
     options: Options,
     state: RwLock<DBState>,
     versions: Mutex<VersionSet>,
+    block_cache: BlockCache,
+    table_cache: TableCache,
     wal: Mutex<WalWriter>,
 }
 
@@ -35,10 +38,13 @@ struct DBInner {
 struct DBState {
     mutable: MemTable,
     immutables: Vec<MemTable>,
-    l0_tables: Vec<Arc<SSTableReader>>,
+    l0_tables: Vec<TableRef>,
+    level_tables: Vec<Vec<TableRef>>,
     last_sequence: SequenceNumber,
     closed: bool,
 }
+
+type TableRef = (FileMeta, Arc<SSTableReader>);
 
 #[derive(Debug, Clone, Copy)]
 enum FlushSource {
@@ -69,11 +75,15 @@ impl DB {
         } else {
             VersionSet::create(&path, options_for_versions)?
         };
-        let l0_tables = open_l0_tables(&path, &versions.current().l0_files)?;
+        let block_cache = BlockCache::new(options.block_cache_capacity);
+        let table_cache = TableCache::new(512);
+        let (l0_tables, level_tables) =
+            open_version_tables(&path, versions.current().as_ref(), &table_cache)?;
         let mut state = DBState {
             mutable: MemTable::new(),
             immutables: Vec::new(),
             l0_tables,
+            level_tables,
             last_sequence: versions.last_sequence(),
             closed: false,
         };
@@ -89,6 +99,8 @@ impl DB {
                 options,
                 state: RwLock::new(state),
                 versions: Mutex::new(versions),
+                block_cache,
+                table_cache,
                 wal: Mutex::new(wal),
             }),
         })
@@ -156,22 +168,58 @@ impl DB {
         self.get_opt(key, ReadOptions::default())
     }
 
-    pub fn get_opt(&self, key: &[u8], _opts: ReadOptions) -> Result<Option<Bytes>> {
-        let state = self.read_state()?;
-        if state.closed {
-            return Err(Error::Closed);
-        }
+    pub fn get_opt(&self, key: &[u8], opts: ReadOptions) -> Result<Option<Bytes>> {
+        let (read_seq, l0_tables, level_tables) = {
+            let state = self.read_state()?;
+            if state.closed {
+                return Err(Error::Closed);
+            }
 
-        if let Some(record) = state.mutable.get(key, state.last_sequence) {
-            return Ok(record.into_visible_value());
-        }
-        for memtable in state.immutables.iter().rev() {
-            if let Some(record) = memtable.get(key, state.last_sequence) {
+            if let Some(record) = state.mutable.get(key, state.last_sequence) {
+                return Ok(record.into_visible_value());
+            }
+            for memtable in state.immutables.iter().rev() {
+                if let Some(record) = memtable.get(key, state.last_sequence) {
+                    return Ok(record.into_visible_value());
+                }
+            }
+
+            (
+                state.last_sequence,
+                state.l0_tables.clone(),
+                state.level_tables.clone(),
+            )
+        };
+
+        for (meta, table) in &l0_tables {
+            if !file_overlaps_user_key(meta, key) {
+                continue;
+            }
+            if let Some(record) = table.get_with_cache(
+                key,
+                read_seq,
+                meta.number,
+                Some(&self.inner.block_cache),
+                opts.fill_cache,
+            )? {
                 return Ok(record.into_visible_value());
             }
         }
-        for table in &state.l0_tables {
-            if let Some(record) = table.get(key, state.last_sequence)? {
+
+        for level in level_tables.iter().skip(1) {
+            let Some((meta, table)) = level
+                .iter()
+                .find(|(meta, _)| file_overlaps_user_key(meta, key))
+            else {
+                continue;
+            };
+            if let Some(record) = table.get_with_cache(
+                key,
+                read_seq,
+                meta.number,
+                Some(&self.inner.block_cache),
+                opts.fill_cache,
+            )? {
                 return Ok(record.into_visible_value());
             }
         }
@@ -179,19 +227,48 @@ impl DB {
     }
 
     pub fn scan(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<Vec<(Bytes, Bytes)>> {
-        let state = self.read_state()?;
-        if state.closed {
-            return Err(Error::Closed);
+        let (read_seq, mem_entries, l0_tables, level_tables) = {
+            let state = self.read_state()?;
+            if state.closed {
+                return Err(Error::Closed);
+            }
+            let mut entries = Vec::new();
+            extend_memtable_entries(&mut entries, &state.mutable);
+            for memtable in state.immutables.iter().rev() {
+                extend_memtable_entries(&mut entries, memtable);
+            }
+            (
+                state.last_sequence,
+                entries,
+                state.l0_tables.clone(),
+                state.level_tables.clone(),
+            )
+        };
+
+        let mut children: Vec<Box<dyn StorageIterator>> = Vec::new();
+        if !mem_entries.is_empty() {
+            children.push(Box::new(EntryIterator::new(mem_entries)));
         }
-        let mut entries = Vec::new();
-        extend_memtable_entries(&mut entries, &state.mutable);
-        for memtable in state.immutables.iter().rev() {
-            extend_memtable_entries(&mut entries, memtable);
+        for (meta, table) in &l0_tables {
+            children.push(Box::new(EntryIterator::new(
+                table.entries_with_cache(meta.number, Some(&self.inner.block_cache))?,
+            )));
         }
-        for table in &state.l0_tables {
-            entries.extend(table.entries()?);
+        for level in &level_tables {
+            for (meta, table) in level {
+                children.push(Box::new(EntryIterator::new(
+                    table.entries_with_cache(meta.number, Some(&self.inner.block_cache))?,
+                )));
+            }
         }
-        Ok(visible_rows(entries, lower, upper, state.last_sequence))
+
+        let mut iter = DBIterator::new(
+            Box::new(MergeIterator::new(children)),
+            bound_to_owned(lower),
+            bound_to_owned(upper),
+            read_seq,
+        );
+        iter.collect()
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -217,8 +294,8 @@ impl DB {
         let file_number = self.allocate_file_number()?;
         match self.write_l0_table(&memtable, file_number) {
             Ok((reader, meta)) => {
-                self.publish_l0_table(meta, state.last_sequence)?;
-                state.l0_tables.insert(0, Arc::new(reader));
+                self.publish_l0_table(meta.clone(), state.last_sequence)?;
+                state.l0_tables.insert(0, (meta, reader));
                 Ok(())
             }
             Err(err) => {
@@ -234,6 +311,10 @@ impl DB {
 
     pub fn sync_wal(&self) -> Result<()> {
         self.write_wal()?.sync()
+    }
+
+    pub fn block_cache_stats(&self) -> CacheStats {
+        self.inner.block_cache.stats()
     }
 
     fn read_state(&self) -> Result<std::sync::RwLockReadGuard<'_, DBState>> {
@@ -272,7 +353,7 @@ impl DB {
         &self,
         memtable: &MemTable,
         file_number: u64,
-    ) -> Result<(SSTableReader, FileMeta)> {
+    ) -> Result<(Arc<SSTableReader>, FileMeta)> {
         let table_name = table_file_name(file_number);
         let tmp_path = self.inner.path.join(format!("{table_name}.tmp"));
         let final_path = self.inner.path.join(table_name);
@@ -289,7 +370,10 @@ impl DB {
         builder.finish()?;
         std::fs::rename(&tmp_path, &final_path)?;
         let file_size = std::fs::metadata(&final_path)?.len();
-        let reader = SSTableReader::open(&final_path)?;
+        let reader = self
+            .inner
+            .table_cache
+            .get_or_open(file_number, &final_path)?;
         let meta = file_meta_from_table(file_number, file_size, &reader)?;
         Ok((reader, meta))
     }
@@ -367,51 +451,6 @@ fn extend_memtable_entries(entries: &mut Vec<(InternalKey, ValueRecord)>, memtab
     );
 }
 
-fn visible_rows(
-    mut entries: Vec<(InternalKey, ValueRecord)>,
-    lower: Bound<&[u8]>,
-    upper: Bound<&[u8]>,
-    read_seq: SequenceNumber,
-) -> Vec<(Bytes, Bytes)> {
-    entries.sort_by(|(left_key, _), (right_key, _)| left_key.cmp(right_key));
-
-    let mut seen = BTreeSet::new();
-    let mut rows = Vec::new();
-    for (internal_key, value) in entries {
-        if internal_key.sequence() > read_seq {
-            continue;
-        }
-        let user_key = internal_key.user_key();
-        if !within_bounds(user_key, &lower, &upper) {
-            continue;
-        }
-
-        let user_key_vec = user_key.to_vec();
-        if !seen.insert(user_key_vec.clone()) {
-            continue;
-        }
-        if let ValueRecord::Put(value) = value {
-            rows.push((user_key_vec, value));
-        }
-    }
-
-    rows
-}
-
-fn within_bounds(key: &[u8], lower: &Bound<&[u8]>, upper: &Bound<&[u8]>) -> bool {
-    let lower_ok = match lower {
-        Bound::Included(bound) => key >= *bound,
-        Bound::Excluded(bound) => key > *bound,
-        Bound::Unbounded => true,
-    };
-    let upper_ok = match upper {
-        Bound::Included(bound) => key <= *bound,
-        Bound::Excluded(bound) => key < *bound,
-        Bound::Unbounded => true,
-    };
-    lower_ok && upper_ok
-}
-
 fn recover_wal(path: &Path, state: &mut DBState) -> Result<()> {
     let mut reader = WalReader::open(path)?;
     while let Some(payload) = reader.read_record()? {
@@ -421,14 +460,33 @@ fn recover_wal(path: &Path, state: &mut DBState) -> Result<()> {
     Ok(())
 }
 
-fn open_l0_tables(db_path: &Path, files: &[FileMeta]) -> Result<Vec<Arc<SSTableReader>>> {
-    let mut tables = Vec::with_capacity(files.len());
-    for file in files {
-        tables.push(Arc::new(SSTableReader::open(
-            db_path.join(table_file_name(file.number)),
-        )?));
+fn open_version_tables(
+    db_path: &Path,
+    version: &Version,
+    table_cache: &TableCache,
+) -> Result<(Vec<TableRef>, Vec<Vec<TableRef>>)> {
+    let mut l0_tables = Vec::with_capacity(version.l0_files.len());
+    for file in &version.l0_files {
+        l0_tables.push((
+            file.clone(),
+            table_cache.get_or_open(file.number, &db_path.join(table_file_name(file.number)))?,
+        ));
     }
-    Ok(tables)
+
+    let mut level_tables = Vec::with_capacity(version.levels.len());
+    for level in &version.levels {
+        let mut tables = Vec::with_capacity(level.len());
+        for file in level {
+            tables.push((
+                file.clone(),
+                table_cache
+                    .get_or_open(file.number, &db_path.join(table_file_name(file.number)))?,
+            ));
+        }
+        level_tables.push(tables);
+    }
+
+    Ok((l0_tables, level_tables))
 }
 
 fn file_meta_from_table(number: u64, file_size: u64, reader: &SSTableReader) -> Result<FileMeta> {
@@ -456,6 +514,18 @@ fn file_meta_from_table(number: u64, file_size: u64, reader: &SSTableReader) -> 
         smallest_seq,
         largest_seq,
     })
+}
+
+fn file_overlaps_user_key(meta: &FileMeta, user_key: &[u8]) -> bool {
+    user_key >= meta.smallest.user_key() && user_key <= meta.largest.user_key()
+}
+
+fn bound_to_owned(bound: Bound<&[u8]>) -> Bound<Bytes> {
+    match bound {
+        Bound::Included(value) => Bound::Included(value.to_vec()),
+        Bound::Excluded(value) => Bound::Excluded(value.to_vec()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
 }
 
 fn apply_batch(state: &mut DBState, start_sequence: SequenceNumber, batch: &WriteBatch) {

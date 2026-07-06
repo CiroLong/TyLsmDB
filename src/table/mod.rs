@@ -2,6 +2,7 @@ pub mod block;
 pub mod block_builder;
 pub mod block_iterator;
 pub mod builder;
+pub mod filter;
 pub mod format;
 pub mod properties;
 pub mod reader;

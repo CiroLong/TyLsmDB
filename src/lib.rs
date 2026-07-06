@@ -1,8 +1,10 @@
 pub mod batch;
 pub mod bytes;
+pub mod cache;
 pub mod db;
 pub mod env;
 pub mod error;
+pub mod iterator;
 pub mod key;
 pub mod memtable;
 pub mod options;
