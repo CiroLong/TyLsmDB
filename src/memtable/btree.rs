@@ -80,6 +80,14 @@ impl MemTable {
     pub fn approximate_size(&self) -> usize {
         self.approximate_size
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (&InternalKey, &ValueRecord)> {
+        self.map.iter()
+    }
 }
 
 fn within_bounds(key: &[u8], lower: &Bound<&[u8]>, upper: &Bound<&[u8]>) -> bool {

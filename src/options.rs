@@ -53,19 +53,10 @@ impl Default for Options {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct WriteOptions {
     pub sync: bool,
     pub disable_wal: bool,
-}
-
-impl Default for WriteOptions {
-    fn default() -> Self {
-        Self {
-            sync: false,
-            disable_wal: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]

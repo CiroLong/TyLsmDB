@@ -58,7 +58,7 @@ mod tests {
 
     #[test]
     fn internal_key_orders_user_key_asc_and_sequence_desc() {
-        let mut keys = vec![
+        let mut keys = [
             InternalKey::new(b"a".to_vec(), 7, ValueType::Put),
             InternalKey::new(b"a".to_vec(), 9, ValueType::Put),
             InternalKey::new(b"b".to_vec(), 1, ValueType::Put),

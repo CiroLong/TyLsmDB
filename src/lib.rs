@@ -6,6 +6,7 @@ pub mod key;
 pub mod memtable;
 pub mod options;
 pub mod snapshot;
+pub mod table;
 pub mod transaction;
 pub mod util;
 pub mod wal;
