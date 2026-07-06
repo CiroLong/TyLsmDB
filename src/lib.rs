@@ -8,6 +8,7 @@ pub mod options;
 pub mod snapshot;
 pub mod transaction;
 pub mod util;
+pub mod wal;
 
 pub use batch::{BatchRecord, WriteBatch};
 pub use db::DB;

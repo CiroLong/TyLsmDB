@@ -1,15 +1,18 @@
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::batch::{BatchRecord, WriteBatch};
 use crate::bytes::Bytes;
 use crate::error::{Error, Result};
 use crate::key::SequenceNumber;
 use crate::memtable::{MemTable, ValueRecord};
-use crate::options::{Options, ReadOptions, WriteOptions};
+use crate::options::{Options, ReadOptions, WalSyncMode, WriteOptions};
 use crate::snapshot::Snapshot;
 use crate::transaction::{Transaction, TransactionOptions};
+use crate::wal::{WalReader, WalWriter};
+
+const ACTIVE_WAL_FILE: &str = "000001.wal";
 
 #[derive(Debug, Clone)]
 pub struct DB {
@@ -21,6 +24,7 @@ struct DBInner {
     path: PathBuf,
     options: Options,
     state: RwLock<DBState>,
+    wal: Mutex<WalWriter>,
 }
 
 #[derive(Debug)]
@@ -32,15 +36,38 @@ struct DBState {
 
 impl DB {
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        if path.exists() && options.error_if_exists {
+            return Err(Error::InvalidArgument(format!(
+                "database already exists: {}",
+                path.display()
+            )));
+        }
+        if !path.exists() && !options.create_if_missing {
+            return Err(Error::InvalidArgument(format!(
+                "database does not exist: {}",
+                path.display()
+            )));
+        }
+        std::fs::create_dir_all(&path)?;
+
+        let wal_path = path.join(ACTIVE_WAL_FILE);
+        let mut state = DBState {
+            mutable: MemTable::new(),
+            last_sequence: 0,
+            closed: false,
+        };
+        if wal_path.exists() {
+            recover_wal(&wal_path, &mut state)?;
+        }
+        let wal = WalWriter::create(&wal_path)?;
+
         Ok(Self {
             inner: Arc::new(DBInner {
-                path: path.as_ref().to_path_buf(),
+                path,
                 options,
-                state: RwLock::new(DBState {
-                    mutable: MemTable::new(),
-                    last_sequence: 0,
-                    closed: false,
-                }),
+                state: RwLock::new(state),
+                wal: Mutex::new(wal),
             }),
         })
     }
@@ -71,7 +98,7 @@ impl DB {
         self.write(batch, WriteOptions::default())
     }
 
-    pub fn write(&self, batch: WriteBatch, _opts: WriteOptions) -> Result<()> {
+    pub fn write(&self, batch: WriteBatch, opts: WriteOptions) -> Result<()> {
         if batch.is_empty() {
             return Ok(());
         }
@@ -81,19 +108,17 @@ impl DB {
             return Err(Error::Closed);
         }
 
-        let mut sequence = state.last_sequence + 1;
-        for record in batch.records() {
-            match record {
-                BatchRecord::Put { key, value } => {
-                    state.mutable.put(sequence, key.clone(), value.clone());
-                }
-                BatchRecord::Delete { key } => {
-                    state.mutable.delete(sequence, key.clone());
-                }
+        let start_sequence = state.last_sequence + 1;
+        if self.inner.options.wal_enabled && !opts.disable_wal {
+            let payload = batch.encode_with_sequence(start_sequence);
+            let mut wal = self.write_wal()?;
+            wal.append(&payload)?;
+            if opts.sync || self.inner.options.wal_sync == WalSyncMode::PerWrite {
+                wal.sync()?;
             }
-            sequence += 1;
         }
-        state.last_sequence = sequence - 1;
+
+        apply_batch(&mut state, start_sequence, &batch);
         Ok(())
     }
 
@@ -140,7 +165,7 @@ impl DB {
     }
 
     pub fn sync_wal(&self) -> Result<()> {
-        Err(Error::Unsupported("WAL arrives in V2"))
+        self.write_wal()?.sync()
     }
 
     fn read_state(&self) -> Result<std::sync::RwLockReadGuard<'_, DBState>> {
@@ -155,5 +180,37 @@ impl DB {
             .state
             .write()
             .map_err(|_| Error::Corruption("db state write lock poisoned".to_string()))
+    }
+
+    fn write_wal(&self) -> Result<std::sync::MutexGuard<'_, WalWriter>> {
+        self.inner
+            .wal
+            .lock()
+            .map_err(|_| Error::Corruption("wal lock poisoned".to_string()))
+    }
+}
+
+fn recover_wal(path: &Path, state: &mut DBState) -> Result<()> {
+    let mut reader = WalReader::open(path)?;
+    while let Some(payload) = reader.read_record()? {
+        let (start_sequence, batch) = WriteBatch::decode_payload(&payload)?;
+        apply_batch(state, start_sequence, &batch);
+    }
+    Ok(())
+}
+
+fn apply_batch(state: &mut DBState, start_sequence: SequenceNumber, batch: &WriteBatch) {
+    let mut sequence = start_sequence;
+    for record in batch.records() {
+        match record {
+            BatchRecord::Put { key, value } => {
+                state.mutable.put(sequence, key.clone(), value.clone());
+            }
+            BatchRecord::Delete { key } => {
+                state.mutable.delete(sequence, key.clone());
+            }
+        }
+        state.last_sequence = state.last_sequence.max(sequence);
+        sequence += 1;
     }
 }
