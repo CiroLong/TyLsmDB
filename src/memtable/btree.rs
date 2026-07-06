@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
@@ -37,12 +38,15 @@ impl MemTable {
     }
 
     pub fn get(&self, key: &[u8], read_seq: SequenceNumber) -> Option<ValueRecord> {
-        self.map
-            .iter()
-            .find(|(internal_key, _)| {
-                internal_key.user_key() == key && internal_key.sequence() <= read_seq
-            })
-            .map(|(_, value)| value.clone())
+        let seek_key = InternalKey::new(key.to_vec(), read_seq, ValueType::Put);
+        for (internal_key, value) in self.map.range(seek_key..) {
+            match internal_key.user_key().cmp(key) {
+                Ordering::Equal => return Some(value.clone()),
+                Ordering::Greater => break,
+                Ordering::Less => {}
+            }
+        }
+        None
     }
 
     pub fn scan(

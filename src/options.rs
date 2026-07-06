@@ -1,4 +1,6 @@
+use crate::memtable::MemTableKind;
 use crate::snapshot::Snapshot;
+use crate::table::format::CompressionType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WalSyncMode {
@@ -27,6 +29,9 @@ pub struct Options {
     pub max_background_flushes: usize,
     pub max_background_compactions: usize,
     pub max_subcompactions: usize,
+    pub memtable_kind: MemTableKind,
+    pub table_compression: CompressionType,
+    pub write_rate_limit_bytes_per_sec: Option<u64>,
 }
 
 impl Default for Options {
@@ -51,6 +56,9 @@ impl Default for Options {
             max_background_flushes: 1,
             max_background_compactions: 1,
             max_subcompactions: 1,
+            memtable_kind: MemTableKind::BTree,
+            table_compression: CompressionType::None,
+            write_rate_limit_bytes_per_sec: None,
         }
     }
 }

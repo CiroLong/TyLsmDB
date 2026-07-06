@@ -5,3 +5,13 @@ edition = "2024"
 
 [dependencies]
 crc32c = "0.6"
+crossbeam-skiplist = "0.1"
+zstd = "0.13"
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.5"
+
+[[bench]]
+name = "write_read"
+harness = false

@@ -6,6 +6,7 @@ use crate::memtable::ValueRecord;
 pub fn compact_entries(
     mut entries: Vec<(InternalKey, ValueRecord)>,
     gc_watermark: SequenceNumber,
+    drop_tombstones: bool,
 ) -> Vec<(InternalKey, ValueRecord)> {
     entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
@@ -20,8 +21,10 @@ pub fn compact_entries(
         if !seen_below_watermark.insert(key.user_key().to_vec()) {
             continue;
         }
-        if let ValueRecord::Put(_) = value {
-            output.push((key, value));
+        match value {
+            ValueRecord::Put(_) => output.push((key, value)),
+            ValueRecord::Delete if !drop_tombstones => output.push((key, value)),
+            ValueRecord::Delete => {}
         }
     }
     output

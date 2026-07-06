@@ -16,13 +16,15 @@ use crate::env::file::{table_file_name, wal_file_name};
 use crate::error::{Error, Result};
 use crate::iterator::{DBIterator, EntryIterator, MergeIterator, StorageIterator};
 use crate::key::{InternalKey, SequenceNumber};
-use crate::memtable::{MemTable, ValueRecord};
+use crate::memtable::{MemTable, MemTableKind, ValueRecord};
+use crate::metrics::{Metrics, MetricsSnapshot};
 use crate::mvcc::conflict::ReadRange;
 use crate::mvcc::watermark::Watermark;
 use crate::options::{Options, ReadOptions, WalSyncMode, WriteOptions};
 use crate::snapshot::Snapshot;
 use crate::table::{SSTableBuilder, SSTableReader};
 use crate::transaction::{Transaction, TransactionOptions};
+use crate::util::rate_limiter::RateLimiter;
 use crate::version::{FileMeta, Version, VersionEdit, VersionSet};
 use crate::wal::{WalReader, WalWriter};
 
@@ -40,6 +42,8 @@ struct DBInner {
     block_cache: BlockCache,
     table_cache: TableCache,
     watermark: Arc<Watermark>,
+    metrics: Metrics,
+    write_rate_limiter: Option<RateLimiter>,
     wal: Mutex<WalWriter>,
 }
 
@@ -90,7 +94,7 @@ impl DB {
         let (l0_tables, level_tables) =
             open_version_tables(&path, versions.current().as_ref(), &table_cache)?;
         let mut state = DBState {
-            mutable: MemTable::new(),
+            mutable: MemTable::new(options.memtable_kind),
             immutables: Vec::new(),
             l0_tables,
             level_tables,
@@ -102,6 +106,7 @@ impl DB {
             recover_wal(&wal_path, &mut state)?;
         }
         let wal = WalWriter::create(&wal_path)?;
+        let write_rate_limiter = options.write_rate_limit_bytes_per_sec.map(RateLimiter::new);
 
         Ok(Self {
             inner: Arc::new(DBInner {
@@ -112,6 +117,8 @@ impl DB {
                 block_cache,
                 table_cache,
                 watermark,
+                metrics: Metrics::new(),
+                write_rate_limiter,
                 wal: Mutex::new(wal),
             }),
         })
@@ -148,6 +155,9 @@ impl DB {
             return Ok(());
         }
 
+        let user_write_bytes = batch_user_write_bytes(&batch);
+        self.inner.metrics.record_user_write(user_write_bytes);
+        self.apply_write_rate_limit(user_write_bytes);
         self.apply_write_pressure()?;
 
         let should_flush = {
@@ -159,6 +169,9 @@ impl DB {
             let start_sequence = state.last_sequence + 1;
             if self.inner.options.wal_enabled && !opts.disable_wal {
                 let payload = batch.encode_with_sequence(start_sequence);
+                self.inner
+                    .metrics
+                    .record_wal_write(wal_record_bytes(&payload));
                 let mut wal = self.write_wal()?;
                 wal.append(&payload)?;
                 if opts.sync || self.inner.options.wal_sync == WalSyncMode::PerWrite {
@@ -167,7 +180,11 @@ impl DB {
             }
 
             apply_batch(&mut state, start_sequence, &batch);
-            freeze_mutable_if_needed(&mut state, self.inner.options.memtable_size)
+            freeze_mutable_if_needed(
+                &mut state,
+                self.inner.options.memtable_size,
+                self.inner.options.memtable_kind,
+            )
         };
 
         if should_flush {
@@ -329,6 +346,9 @@ impl DB {
         read_ranges: &[ReadRange],
     ) -> Result<()> {
         let write_keys = batch_write_keys(&batch);
+        let user_write_bytes = batch_user_write_bytes(&batch);
+        self.inner.metrics.record_user_write(user_write_bytes);
+        self.apply_write_rate_limit(user_write_bytes);
         self.apply_write_pressure()?;
 
         let should_flush = {
@@ -351,6 +371,9 @@ impl DB {
             let start_sequence = state.last_sequence + 1;
             if self.inner.options.wal_enabled {
                 let payload = batch.encode_with_sequence(start_sequence);
+                self.inner
+                    .metrics
+                    .record_wal_write(wal_record_bytes(&payload));
                 let mut wal = self.write_wal()?;
                 wal.append(&payload)?;
                 if self.inner.options.wal_sync == WalSyncMode::PerWrite {
@@ -359,7 +382,11 @@ impl DB {
             }
 
             apply_batch(&mut state, start_sequence, &batch);
-            freeze_mutable_if_needed(&mut state, self.inner.options.memtable_size)
+            freeze_mutable_if_needed(
+                &mut state,
+                self.inner.options.memtable_size,
+                self.inner.options.memtable_kind,
+            )
         };
 
         if should_flush {
@@ -375,7 +402,9 @@ impl DB {
             return Err(Error::Closed);
         }
 
-        let Some((memtable, source)) = take_oldest_flushable_memtable(&mut state) else {
+        let Some((memtable, source)) =
+            take_oldest_flushable_memtable(&mut state, self.inner.options.memtable_kind)
+        else {
             return Ok(());
         };
 
@@ -416,6 +445,10 @@ impl DB {
 
     pub fn block_cache_stats(&self) -> CacheStats {
         self.inner.block_cache.stats()
+    }
+
+    pub fn metrics_snapshot(&self) -> MetricsSnapshot {
+        self.inner.metrics.snapshot(self.inner.block_cache.stats())
     }
 
     pub fn level_file_counts(&self) -> Vec<usize> {
@@ -524,13 +557,13 @@ impl DB {
         mut predicate: impl FnMut(&InternalKey) -> bool,
     ) -> Result<bool> {
         for (key, _) in state.mutable.entries() {
-            if key.sequence() > read_seq && predicate(key) {
+            if key.sequence() > read_seq && predicate(&key) {
                 return Ok(true);
             }
         }
         for memtable in &state.immutables {
             for (key, _) in memtable.entries() {
-                if key.sequence() > read_seq && predicate(key) {
+                if key.sequence() > read_seq && predicate(&key) {
                     return Ok(true);
                 }
             }
@@ -582,13 +615,18 @@ impl DB {
                 final_path.display()
             )));
         }
-        let mut builder = SSTableBuilder::create(&tmp_path, self.inner.options.block_size)?;
+        let mut builder = SSTableBuilder::create_with_compression(
+            &tmp_path,
+            self.inner.options.block_size,
+            self.inner.options.table_compression,
+        )?;
         for (key, value) in memtable.entries() {
-            builder.add(key.clone(), value)?;
+            builder.add(key, &value)?;
         }
         builder.finish()?;
         std::fs::rename(&tmp_path, &final_path)?;
         let file_size = std::fs::metadata(&final_path)?.len();
+        self.inner.metrics.record_sst_write(file_size);
         let reader = self
             .inner
             .table_cache
@@ -628,6 +666,16 @@ impl DB {
         Ok(())
     }
 
+    fn apply_write_rate_limit(&self, bytes: u64) {
+        let Some(limiter) = &self.inner.write_rate_limiter else {
+            return;
+        };
+        let wait = limiter.reserve(bytes);
+        if !wait.is_zero() {
+            thread::sleep(wait);
+        }
+    }
+
     fn execute_compaction(&self, task: CompactionTask) -> Result<bool> {
         if task.input_files.is_empty() {
             return Ok(false);
@@ -638,8 +686,11 @@ impl DB {
             .watermark
             .oldest()
             .unwrap_or(self.read_state()?.last_sequence);
+        let drop_tombstones = self.can_drop_tombstones(&task)?;
 
-        if task.is_trivial_move() && !self.trivial_move_needs_rewrite(&task, gc_watermark)? {
+        if task.is_trivial_move()
+            && !self.trivial_move_needs_rewrite(&task, gc_watermark, drop_tombstones)?
+        {
             let meta = task.input_files[0].clone();
             {
                 let mut versions = self.write_versions()?;
@@ -658,6 +709,7 @@ impl DB {
 
         let mut entries = Vec::new();
         for file in task.all_input_files() {
+            self.inner.metrics.record_compaction_read(file.file_size);
             let table = self.inner.table_cache.get_or_open(
                 file.number,
                 &self.inner.path.join(table_file_name(file.number)),
@@ -665,13 +717,8 @@ impl DB {
             entries.extend(table.entries_with_cache(file.number, Some(&self.inner.block_cache))?);
         }
 
-        let output_entries = compact_entries(entries, gc_watermark);
-        let output = if output_entries.is_empty() {
-            None
-        } else {
-            let number = self.allocate_file_number()?;
-            Some(self.write_compaction_output(number, output_entries)?)
-        };
+        let output_entries = compact_entries(entries, gc_watermark, drop_tombstones);
+        let outputs = self.write_compaction_outputs(output_entries)?;
 
         {
             let mut versions = self.write_versions()?;
@@ -690,7 +737,7 @@ impl DB {
                     number: file.number,
                 })?;
             }
-            if let Some((_, meta)) = &output {
+            for (_, meta) in &outputs {
                 versions.log_and_apply(VersionEdit::AddFile {
                     level: task.output_level,
                     meta: meta.clone(),
@@ -707,6 +754,7 @@ impl DB {
         &self,
         task: &CompactionTask,
         gc_watermark: SequenceNumber,
+        drop_tombstones: bool,
     ) -> Result<bool> {
         let file = &task.input_files[0];
         let table = self.inner.table_cache.get_or_open(
@@ -714,8 +762,45 @@ impl DB {
             &self.inner.path.join(table_file_name(file.number)),
         )?;
         let entries = table.entries_with_cache(file.number, Some(&self.inner.block_cache))?;
-        let compacted_entries = compact_entries(entries.clone(), gc_watermark);
+        let compacted_entries = compact_entries(entries.clone(), gc_watermark, drop_tombstones);
         Ok(compacted_entries.len() != entries.len())
+    }
+
+    fn can_drop_tombstones(&self, task: &CompactionTask) -> Result<bool> {
+        let versions = self.write_versions()?;
+        let current = versions.current();
+        Ok(!current
+            .levels
+            .iter()
+            .skip(task.output_level + 1)
+            .flatten()
+            .any(|file| {
+                file.user_key_overlaps_range(
+                    task.smallest_user_key.as_slice(),
+                    task.largest_user_key.as_slice(),
+                )
+            }))
+    }
+
+    fn write_compaction_outputs(
+        &self,
+        entries: Vec<(InternalKey, ValueRecord)>,
+    ) -> Result<Vec<(Arc<SSTableReader>, FileMeta)>> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let chunks = split_compaction_entries(
+            entries,
+            self.inner.options.target_file_size_base,
+            self.inner.options.max_subcompactions,
+        );
+        let mut outputs = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let number = self.allocate_file_number()?;
+            outputs.push(self.write_compaction_output(number, chunk)?);
+        }
+        Ok(outputs)
     }
 
     fn write_compaction_output(
@@ -726,13 +811,19 @@ impl DB {
         let table_name = table_file_name(file_number);
         let tmp_path = self.inner.path.join(format!("{table_name}.tmp"));
         let final_path = self.inner.path.join(table_name);
-        let mut builder = SSTableBuilder::create(&tmp_path, self.inner.options.block_size)?;
+        let mut builder = SSTableBuilder::create_with_compression(
+            &tmp_path,
+            self.inner.options.block_size,
+            self.inner.options.table_compression,
+        )?;
         for (key, value) in entries {
             builder.add(key, &value)?;
         }
         builder.finish()?;
         std::fs::rename(&tmp_path, &final_path)?;
         let file_size = std::fs::metadata(&final_path)?.len();
+        self.inner.metrics.record_sst_write(file_size);
+        self.inner.metrics.record_compaction_write(file_size);
         let reader = self
             .inner
             .table_cache
@@ -777,23 +868,34 @@ impl IntoVisibleValue for ValueRecord {
     }
 }
 
-fn freeze_mutable_if_needed(state: &mut DBState, memtable_size: usize) -> bool {
+fn freeze_mutable_if_needed(
+    state: &mut DBState,
+    memtable_size: usize,
+    memtable_kind: MemTableKind,
+) -> bool {
     if state.mutable.is_empty() || state.mutable.approximate_size() < memtable_size {
         return false;
     }
 
-    state.immutables.push(mem::take(&mut state.mutable));
+    let frozen = mem::replace(&mut state.mutable, MemTable::new(memtable_kind));
+    state.immutables.push(frozen);
     true
 }
 
-fn take_oldest_flushable_memtable(state: &mut DBState) -> Option<(MemTable, FlushSource)> {
+fn take_oldest_flushable_memtable(
+    state: &mut DBState,
+    memtable_kind: MemTableKind,
+) -> Option<(MemTable, FlushSource)> {
     if !state.immutables.is_empty() {
         return Some((state.immutables.remove(0), FlushSource::ImmutableOldest));
     }
     if state.mutable.is_empty() {
         return None;
     }
-    Some((mem::take(&mut state.mutable), FlushSource::Mutable))
+    Some((
+        mem::replace(&mut state.mutable, MemTable::new(memtable_kind)),
+        FlushSource::Mutable,
+    ))
 }
 
 fn restore_flush_memtable(state: &mut DBState, memtable: MemTable, source: FlushSource) {
@@ -812,11 +914,7 @@ fn restore_flush_memtable(state: &mut DBState, memtable: MemTable, source: Flush
 }
 
 fn extend_memtable_entries(entries: &mut Vec<(InternalKey, ValueRecord)>, memtable: &MemTable) {
-    entries.extend(
-        memtable
-            .entries()
-            .map(|(key, value)| (key.clone(), value.clone())),
-    );
+    entries.extend(memtable.entries());
 }
 
 fn recover_wal(path: &Path, state: &mut DBState) -> Result<()> {
@@ -888,6 +986,16 @@ fn file_overlaps_user_key(meta: &FileMeta, user_key: &[u8]) -> bool {
     user_key >= meta.smallest.user_key() && user_key <= meta.largest.user_key()
 }
 
+trait FileMetaUserKeyOverlap {
+    fn user_key_overlaps_range(&self, smallest: &[u8], largest: &[u8]) -> bool;
+}
+
+impl FileMetaUserKeyOverlap for FileMeta {
+    fn user_key_overlaps_range(&self, smallest: &[u8], largest: &[u8]) -> bool {
+        self.smallest.user_key() <= largest && self.largest.user_key() >= smallest
+    }
+}
+
 fn bound_to_owned(bound: Bound<&[u8]>) -> Bound<Bytes> {
     match bound {
         Bound::Included(value) => Bound::Included(value.to_vec()),
@@ -926,6 +1034,66 @@ fn batch_write_keys(batch: &WriteBatch) -> BTreeSet<Bytes> {
             BatchRecord::Put { key, .. } | BatchRecord::Delete { key } => key.clone(),
         })
         .collect()
+}
+
+fn batch_user_write_bytes(batch: &WriteBatch) -> u64 {
+    batch
+        .records()
+        .iter()
+        .map(|record| match record {
+            BatchRecord::Put { key, value } => key.len() + value.len(),
+            BatchRecord::Delete { key } => key.len(),
+        } as u64)
+        .sum()
+}
+
+fn wal_record_bytes(payload: &[u8]) -> u64 {
+    payload.len() as u64 + 9
+}
+
+fn split_compaction_entries(
+    entries: Vec<(InternalKey, ValueRecord)>,
+    target_file_size: usize,
+    max_outputs: usize,
+) -> Vec<Vec<(InternalKey, ValueRecord)>> {
+    let max_outputs = max_outputs.max(1);
+    let target_file_size = target_file_size.max(1);
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_size = 0;
+    let mut previous_user_key = Vec::new();
+
+    for entry in entries {
+        let entry_size = estimate_entry_size(&entry);
+        let user_key_changed =
+            previous_user_key.is_empty() || previous_user_key.as_slice() != entry.0.user_key();
+        if !current.is_empty()
+            && user_key_changed
+            && current_size >= target_file_size
+            && chunks.len() + 1 < max_outputs
+        {
+            chunks.push(current);
+            current = Vec::new();
+            current_size = 0;
+        }
+        previous_user_key = entry.0.user_key().to_vec();
+        current_size += entry_size;
+        current.push(entry);
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn estimate_entry_size((key, value): &(InternalKey, ValueRecord)) -> usize {
+    key.user_key().len()
+        + std::mem::size_of::<InternalKey>()
+        + match value {
+            ValueRecord::Put(value) => value.len(),
+            ValueRecord::Delete => 0,
+        }
 }
 
 fn apply_batch(state: &mut DBState, start_sequence: SequenceNumber, batch: &WriteBatch) {

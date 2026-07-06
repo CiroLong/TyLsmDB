@@ -9,12 +9,14 @@ pub const BLOCK_TRAILER_SIZE: usize = 5;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompressionType {
     None = 0,
+    Zstd = 1,
 }
 
 impl CompressionType {
     pub fn from_u8(value: u8) -> Result<Self> {
         match value {
             0 => Ok(Self::None),
+            1 => Ok(Self::Zstd),
             _ => Err(Error::Corruption(
                 "unknown block compression type".to_string(),
             )),

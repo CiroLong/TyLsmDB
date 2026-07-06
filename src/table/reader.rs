@@ -172,11 +172,6 @@ pub(crate) fn read_block(file: &mut File, handle: BlockHandle) -> Result<Vec<u8>
     let mut trailer = [0_u8; BLOCK_TRAILER_SIZE];
     file.read_exact(&mut trailer)?;
     let compression = CompressionType::from_u8(trailer[0])?;
-    if compression != CompressionType::None {
-        return Err(Error::Corruption(
-            "compressed block is unsupported".to_string(),
-        ));
-    }
     let expected = u32::from_le_bytes(trailer[1..5].try_into().expect("checksum bytes"));
     let mut checksum_input = Vec::with_capacity(1 + block.len());
     checksum_input.push(trailer[0]);
@@ -188,7 +183,10 @@ pub(crate) fn read_block(file: &mut File, handle: BlockHandle) -> Result<Vec<u8>
         ));
     }
 
-    Ok(block)
+    match compression {
+        CompressionType::None => Ok(block),
+        CompressionType::Zstd => zstd::stream::decode_all(block.as_slice()).map_err(Into::into),
+    }
 }
 
 fn decode_index_entries(bytes: &[u8]) -> Result<Vec<IndexEntry>> {

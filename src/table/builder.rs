@@ -27,6 +27,7 @@ pub struct SSTableBuilder {
     largest_key: Option<InternalKey>,
     filter_keys: Vec<Vec<u8>>,
     num_entries: u64,
+    compression: CompressionType,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +39,14 @@ pub(crate) struct IndexEntry {
 
 impl SSTableBuilder {
     pub fn create(path: impl AsRef<Path>, block_size: usize) -> Result<Self> {
+        Self::create_with_compression(path, block_size, CompressionType::None)
+    }
+
+    pub fn create_with_compression(
+        path: impl AsRef<Path>,
+        block_size: usize,
+        compression: CompressionType,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = OpenOptions::new()
             .create(true)
@@ -56,6 +65,7 @@ impl SSTableBuilder {
             largest_key: None,
             filter_keys: Vec::new(),
             num_entries: 0,
+            compression,
         })
     }
 
@@ -126,17 +136,25 @@ impl SSTableBuilder {
     }
 
     fn write_block(&mut self, block: &[u8]) -> Result<BlockHandle> {
+        let block = compress_block(block, self.compression)?;
         let handle = BlockHandle::new(self.offset, block.len() as u64);
-        self.file.write_all(block)?;
-        let compression = CompressionType::None as u8;
+        self.file.write_all(&block)?;
+        let compression = self.compression as u8;
         let mut checksum_input = Vec::with_capacity(1 + block.len());
         checksum_input.push(compression);
-        checksum_input.extend_from_slice(block);
+        checksum_input.extend_from_slice(&block);
         let checksum = crc32c(&checksum_input);
         self.file.write_all(&[compression])?;
         self.file.write_all(&checksum.to_le_bytes())?;
         self.offset += block.len() as u64 + BLOCK_TRAILER_SIZE as u64;
         Ok(handle)
+    }
+}
+
+fn compress_block(block: &[u8], compression: CompressionType) -> Result<Vec<u8>> {
+    match compression {
+        CompressionType::None => Ok(block.to_vec()),
+        CompressionType::Zstd => zstd::stream::encode_all(block, 0).map_err(Into::into),
     }
 }
 

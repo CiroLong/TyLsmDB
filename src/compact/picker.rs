@@ -114,6 +114,9 @@ impl CompactionPicker {
             .levels
             .get(output_level)
             .map(|level| {
+                if input_level == 0 {
+                    return level.clone();
+                }
                 level
                     .iter()
                     .filter(|file| {
