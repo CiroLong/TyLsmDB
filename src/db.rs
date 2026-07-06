@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::batch::{BatchRecord, WriteBatch};
 use crate::bytes::Bytes;
+use crate::env::file::{table_file_name, wal_file_name};
 use crate::error::{Error, Result};
 use crate::key::{InternalKey, SequenceNumber};
 use crate::memtable::{MemTable, ValueRecord};
@@ -13,9 +14,8 @@ use crate::options::{Options, ReadOptions, WalSyncMode, WriteOptions};
 use crate::snapshot::Snapshot;
 use crate::table::{SSTableBuilder, SSTableReader};
 use crate::transaction::{Transaction, TransactionOptions};
+use crate::version::{FileMeta, VersionEdit, VersionSet};
 use crate::wal::{WalReader, WalWriter};
-
-const ACTIVE_WAL_FILE: &str = "000001.wal";
 
 #[derive(Debug, Clone)]
 pub struct DB {
@@ -27,6 +27,7 @@ struct DBInner {
     path: PathBuf,
     options: Options,
     state: RwLock<DBState>,
+    versions: Mutex<VersionSet>,
     wal: Mutex<WalWriter>,
 }
 
@@ -35,7 +36,6 @@ struct DBState {
     mutable: MemTable,
     immutables: Vec<MemTable>,
     l0_tables: Vec<Arc<SSTableReader>>,
-    next_file_number: u64,
     last_sequence: SequenceNumber,
     closed: bool,
 }
@@ -63,15 +63,21 @@ impl DB {
         }
         std::fs::create_dir_all(&path)?;
 
-        let wal_path = path.join(ACTIVE_WAL_FILE);
+        let options_for_versions = options.clone();
+        let versions = if path.join("CURRENT").exists() {
+            VersionSet::recover(&path, options_for_versions)?
+        } else {
+            VersionSet::create(&path, options_for_versions)?
+        };
+        let l0_tables = open_l0_tables(&path, &versions.current().l0_files)?;
         let mut state = DBState {
             mutable: MemTable::new(),
             immutables: Vec::new(),
-            l0_tables: Vec::new(),
-            next_file_number: next_table_file_number(&path)?,
-            last_sequence: 0,
+            l0_tables,
+            last_sequence: versions.last_sequence(),
             closed: false,
         };
+        let wal_path = path.join(wal_file_name(versions.log_number()));
         if wal_path.exists() {
             recover_wal(&wal_path, &mut state)?;
         }
@@ -82,6 +88,7 @@ impl DB {
                 path,
                 options,
                 state: RwLock::new(state),
+                versions: Mutex::new(versions),
                 wal: Mutex::new(wal),
             }),
         })
@@ -198,18 +205,24 @@ impl DB {
     }
 
     pub fn flush(&self) -> Result<()> {
-        let Some((memtable, source, file_number)) = self.take_flush_memtable()? else {
+        let mut state = self.write_state()?;
+        if state.closed {
+            return Err(Error::Closed);
+        }
+
+        let Some((memtable, source)) = take_oldest_flushable_memtable(&mut state) else {
             return Ok(());
         };
 
+        let file_number = self.allocate_file_number()?;
         match self.write_l0_table(&memtable, file_number) {
-            Ok(reader) => {
-                let mut state = self.write_state()?;
+            Ok((reader, meta)) => {
+                self.publish_l0_table(meta, state.last_sequence)?;
                 state.l0_tables.insert(0, Arc::new(reader));
                 Ok(())
             }
             Err(err) => {
-                self.restore_flush_memtable(memtable, source)?;
+                restore_flush_memtable(&mut state, memtable, source);
                 Err(err)
             }
         }
@@ -244,47 +257,58 @@ impl DB {
             .map_err(|_| Error::Corruption("wal lock poisoned".to_string()))
     }
 
-    fn take_flush_memtable(&self) -> Result<Option<(MemTable, FlushSource, u64)>> {
-        let mut state = self.write_state()?;
-        if state.closed {
-            return Err(Error::Closed);
-        }
-
-        let Some((memtable, source)) = take_oldest_flushable_memtable(&mut state) else {
-            return Ok(None);
-        };
-        let file_number = state.next_file_number;
-        state.next_file_number += 1;
-        Ok(Some((memtable, source, file_number)))
+    fn write_versions(&self) -> Result<std::sync::MutexGuard<'_, VersionSet>> {
+        self.inner
+            .versions
+            .lock()
+            .map_err(|_| Error::Corruption("version set lock poisoned".to_string()))
     }
 
-    fn restore_flush_memtable(&self, memtable: MemTable, source: FlushSource) -> Result<()> {
-        let mut state = self.write_state()?;
-        match source {
-            FlushSource::Mutable => {
-                if state.mutable.is_empty() {
-                    state.mutable = memtable;
-                } else {
-                    state.immutables.push(memtable);
-                }
-            }
-            FlushSource::ImmutableOldest => {
-                state.immutables.insert(0, memtable);
-            }
-        }
-        Ok(())
+    fn allocate_file_number(&self) -> Result<u64> {
+        Ok(self.write_versions()?.allocate_file_number())
     }
 
-    fn write_l0_table(&self, memtable: &MemTable, file_number: u64) -> Result<SSTableReader> {
-        let tmp_path = self.inner.path.join(format!("{file_number:06}.sst.tmp"));
-        let final_path = self.inner.path.join(format!("{file_number:06}.sst"));
+    fn write_l0_table(
+        &self,
+        memtable: &MemTable,
+        file_number: u64,
+    ) -> Result<(SSTableReader, FileMeta)> {
+        let table_name = table_file_name(file_number);
+        let tmp_path = self.inner.path.join(format!("{table_name}.tmp"));
+        let final_path = self.inner.path.join(table_name);
+        if final_path.exists() {
+            return Err(Error::Corruption(format!(
+                "table file already exists: {}",
+                final_path.display()
+            )));
+        }
         let mut builder = SSTableBuilder::create(&tmp_path, self.inner.options.block_size)?;
         for (key, value) in memtable.entries() {
             builder.add(key.clone(), value)?;
         }
         builder.finish()?;
         std::fs::rename(&tmp_path, &final_path)?;
-        SSTableReader::open(&final_path)
+        let file_size = std::fs::metadata(&final_path)?.len();
+        let reader = SSTableReader::open(&final_path)?;
+        let meta = file_meta_from_table(file_number, file_size, &reader)?;
+        Ok((reader, meta))
+    }
+
+    fn publish_l0_table(&self, meta: FileMeta, last_sequence: SequenceNumber) -> Result<()> {
+        let new_wal = {
+            let mut versions = self.write_versions()?;
+            versions.log_and_apply(VersionEdit::AddFile { level: 0, meta })?;
+            versions.log_and_apply(VersionEdit::LastSequence(last_sequence))?;
+
+            let new_log_number = versions.allocate_file_number();
+            let wal_path = self.inner.path.join(wal_file_name(new_log_number));
+            let new_wal = WalWriter::create(&wal_path)?;
+            versions.log_and_apply(VersionEdit::LogNumber(new_log_number))?;
+            new_wal
+        };
+
+        *self.write_wal()? = new_wal;
+        Ok(())
     }
 }
 
@@ -318,6 +342,21 @@ fn take_oldest_flushable_memtable(state: &mut DBState) -> Option<(MemTable, Flus
         return None;
     }
     Some((mem::take(&mut state.mutable), FlushSource::Mutable))
+}
+
+fn restore_flush_memtable(state: &mut DBState, memtable: MemTable, source: FlushSource) {
+    match source {
+        FlushSource::Mutable => {
+            if state.mutable.is_empty() {
+                state.mutable = memtable;
+            } else {
+                state.immutables.push(memtable);
+            }
+        }
+        FlushSource::ImmutableOldest => {
+            state.immutables.insert(0, memtable);
+        }
+    }
 }
 
 fn extend_memtable_entries(entries: &mut Vec<(InternalKey, ValueRecord)>, memtable: &MemTable) {
@@ -373,27 +412,6 @@ fn within_bounds(key: &[u8], lower: &Bound<&[u8]>, upper: &Bound<&[u8]>) -> bool
     lower_ok && upper_ok
 }
 
-fn next_table_file_number(path: &Path) -> Result<u64> {
-    if !path.exists() {
-        return Ok(2);
-    }
-
-    let mut next = 2;
-    for entry in std::fs::read_dir(path)? {
-        let path = entry?.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("sst") {
-            continue;
-        }
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        if let Ok(number) = stem.parse::<u64>() {
-            next = next.max(number + 1);
-        }
-    }
-    Ok(next)
-}
-
 fn recover_wal(path: &Path, state: &mut DBState) -> Result<()> {
     let mut reader = WalReader::open(path)?;
     while let Some(payload) = reader.read_record()? {
@@ -401,6 +419,43 @@ fn recover_wal(path: &Path, state: &mut DBState) -> Result<()> {
         apply_batch(state, start_sequence, &batch);
     }
     Ok(())
+}
+
+fn open_l0_tables(db_path: &Path, files: &[FileMeta]) -> Result<Vec<Arc<SSTableReader>>> {
+    let mut tables = Vec::with_capacity(files.len());
+    for file in files {
+        tables.push(Arc::new(SSTableReader::open(
+            db_path.join(table_file_name(file.number)),
+        )?));
+    }
+    Ok(tables)
+}
+
+fn file_meta_from_table(number: u64, file_size: u64, reader: &SSTableReader) -> Result<FileMeta> {
+    let entries = reader.entries()?;
+    let (smallest_seq, largest_seq) = entries
+        .iter()
+        .map(|(key, _)| key.sequence())
+        .fold(None, |range: Option<(u64, u64)>, sequence| match range {
+            Some((smallest, largest)) => Some((smallest.min(sequence), largest.max(sequence))),
+            None => Some((sequence, sequence)),
+        })
+        .ok_or_else(|| Error::Corruption("empty SSTable has no sequence range".to_string()))?;
+
+    Ok(FileMeta {
+        number,
+        file_size,
+        smallest: reader
+            .smallest_key()
+            .cloned()
+            .ok_or_else(|| Error::Corruption("empty SSTable has no smallest key".to_string()))?,
+        largest: reader
+            .largest_key()
+            .cloned()
+            .ok_or_else(|| Error::Corruption("empty SSTable has no largest key".to_string()))?,
+        smallest_seq,
+        largest_seq,
+    })
 }
 
 fn apply_batch(state: &mut DBState, start_sequence: SequenceNumber, batch: &WriteBatch) {

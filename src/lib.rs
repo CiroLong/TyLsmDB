@@ -1,6 +1,7 @@
 pub mod batch;
 pub mod bytes;
 pub mod db;
+pub mod env;
 pub mod error;
 pub mod key;
 pub mod memtable;
@@ -9,6 +10,7 @@ pub mod snapshot;
 pub mod table;
 pub mod transaction;
 pub mod util;
+pub mod version;
 pub mod wal;
 
 pub use batch::{BatchRecord, WriteBatch};
