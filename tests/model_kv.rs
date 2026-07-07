@@ -90,6 +90,51 @@ fn put_delete_survives_reopen_flush_and_compact() {
     }
 }
 
+#[test]
+fn deleted_key_does_not_reappear_after_flush_compact_and_reopen() {
+    let path = fresh_dir("deleted_key_does_not_reappear_after_flush_compact_and_reopen");
+    let mut db = DB::open(&path, test_options()).expect("open db");
+    let mut oracle = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+
+    for (op, key_id, value_id) in [
+        (0, 8, 0),
+        (5, 2, 11),
+        (6, 11, 62),
+        (6, 0, 6),
+        (0, 14, 23),
+        (0, 13, 58),
+        (2, 8, 24),
+        (1, 13, 47),
+        (0, 2, 12),
+        (2, 0, 29),
+        (2, 11, 22),
+        (6, 14, 3),
+        (5, 8, 34),
+        (6, 3, 33),
+    ] {
+        let key = format!("rk-{key_id:02}").into_bytes();
+        let value = format!("rv-{value_id:02}").into_bytes();
+        match op {
+            0 | 1 => {
+                db.put(&key, &value).expect("put");
+                oracle.insert(key, value);
+            }
+            2 => {
+                db.delete(&key).expect("delete");
+                oracle.remove(&key);
+            }
+            5 => db.flush().expect("flush"),
+            6 => {
+                db.compact_range(Unbounded, Unbounded).expect("compact");
+                drop(db);
+                db = DB::open(&path, test_options()).expect("reopen");
+            }
+            _ => unreachable!("test sequence only uses write/flush/compact"),
+        }
+        assert_full_scan_matches(&db, &oracle);
+    }
+}
+
 fn assert_full_scan_matches(db: &DB, oracle: &BTreeMap<Vec<u8>, Vec<u8>>) {
     assert_eq!(
         db.scan(Unbounded, Unbounded).expect("scan"),

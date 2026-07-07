@@ -109,7 +109,7 @@ impl CompactionPicker {
         is_manual: bool,
     ) -> CompactionTask {
         let output_level = (input_level + 1).min(version.levels.len().saturating_sub(1));
-        let (smallest_user_key, largest_user_key) = user_key_range(&input_files);
+        let (input_smallest_user_key, input_largest_user_key) = user_key_range(&input_files);
         let overlap_files = version
             .levels
             .get(output_level)
@@ -121,14 +121,19 @@ impl CompactionPicker {
                     .iter()
                     .filter(|file| {
                         file.user_key_overlaps(
-                            smallest_user_key.as_slice(),
-                            largest_user_key.as_slice(),
+                            input_smallest_user_key.as_slice(),
+                            input_largest_user_key.as_slice(),
                         )
                     })
                     .cloned()
                     .collect()
             })
             .unwrap_or_default();
+        let (smallest_user_key, largest_user_key) = if overlap_files.is_empty() {
+            (input_smallest_user_key, input_largest_user_key)
+        } else {
+            user_key_range(input_files.iter().chain(overlap_files.iter()))
+        };
 
         CompactionTask {
             input_level,
@@ -152,7 +157,8 @@ impl UserKeyOverlap for FileMeta {
     }
 }
 
-fn user_key_range(files: &[FileMeta]) -> (Vec<u8>, Vec<u8>) {
+fn user_key_range<'a>(files: impl IntoIterator<Item = &'a FileMeta>) -> (Vec<u8>, Vec<u8>) {
+    let files = files.into_iter().collect::<Vec<_>>();
     let smallest = files
         .iter()
         .map(|file| file.smallest.user_key())
