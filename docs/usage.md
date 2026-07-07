@@ -8,7 +8,7 @@
 
 ```rust
 use tylsmdb::{
-    DB, Error, MetricsSnapshot, Options, ReadOptions, Result, Snapshot, Transaction,
+    DB, DBIterator, Error, MetricsSnapshot, Options, ReadOptions, Result, Snapshot, Transaction,
     TransactionOptions, WalSyncMode, WriteBatch, WriteOptions,
 };
 ```
@@ -167,7 +167,7 @@ fn durable_writes() -> Result<()> {
 
 ## 范围扫描
 
-`scan` 返回有序、去重后的可见 user key/value 列表。边界使用 `std::ops::Bound<&[u8]>`：
+`scan` 返回有序、去重后的可见 user key/value 列表。`scan_iter` 返回流式 cursor-style iterator，适合大范围读取。边界使用 `std::ops::Bound<&[u8]>`：
 
 ```rust
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -189,11 +189,21 @@ fn scan_examples() -> Result<()> {
     let all = db.scan(Unbounded, Unbounded)?;
     assert_eq!(all.len(), 3);
 
+    let mut iter: DBIterator = db.scan_iter(Included(b"a".as_slice()), Unbounded)?;
+    while iter.is_valid() {
+        println!(
+            "{}={}",
+            String::from_utf8_lossy(iter.key().expect("valid key")),
+            String::from_utf8_lossy(iter.value().expect("valid value"))
+        );
+        iter.next()?;
+    }
+
     Ok(())
 }
 ```
 
-`scan` 会合并 mutable memtable、immutable memtables、L0 tables 和 lower levels，并按 read sequence 过滤旧版本和 tombstone。
+`scan` 和 `scan_iter` 都会合并 mutable memtable、immutable memtables、L0 tables 和 lower levels，并按 read sequence 过滤旧版本和 tombstone。`scan` 内部通过 `scan_iter` 收集成 `Vec`；`scan_iter` 对 SSTable 按 block 懒加载，并遵守 `ReadOptions.fill_cache`。
 
 ## ReadOptions 与 snapshot read
 
@@ -498,7 +508,7 @@ fn close_example() -> Result<()> {
 
 ## 当前 API 注意事项
 
-- `DB::scan` 和 `scan_opt` 当前直接返回 `Vec<(Vec<u8>, Vec<u8>)>`，不是流式 iterator。
+- `DB::scan` 和 `scan_opt` 当前仍返回 `Vec<(Vec<u8>, Vec<u8>)>` 作为便捷 API；需要流式读取时使用 `scan_iter` 或 `scan_iter_opt`。
 - `DB::snapshot()` 在内部 state lock 出错时会返回 read sequence 为 `0` 的 snapshot；正常使用下应通过返回的 snapshot 搭配 `ReadOptions` 读取。
 - `ReadOptions.verify_checksums` 和 `ReadOptions.total_order_seek` 当前没有实际控制分支。
 - `Options.max_background_flushes` 和 `Options.max_background_compactions` 当前没有启动后台 worker；flush 和 manual compaction 是同步方法。

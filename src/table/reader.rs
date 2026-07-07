@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::cache::BlockCache;
 use crate::env::{Env, FsEnv, ReadableFile};
 use crate::error::{Error, Result};
+use crate::iterator::StorageIterator;
 use crate::key::InternalKey;
 use crate::memtable::ValueRecord;
 use crate::table::block::Block;
@@ -139,6 +140,22 @@ impl SSTableReader {
         Ok(entries)
     }
 
+    pub(crate) fn storage_iter(
+        &self,
+        table_number: u64,
+        block_cache: Option<BlockCache>,
+        fill_cache: bool,
+    ) -> Result<SSTableStorageIterator> {
+        SSTableStorageIterator::new(
+            Arc::clone(&self.env),
+            self.path.clone(),
+            self.index.clone(),
+            table_number,
+            block_cache,
+            fill_cache,
+        )
+    }
+
     fn read_decoded_block(
         &self,
         file: &mut dyn ReadableFile,
@@ -161,6 +178,146 @@ impl SSTableReader {
         }
         Ok(block)
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct SSTableStorageIterator {
+    file: Box<dyn ReadableFile>,
+    index: Vec<IndexEntry>,
+    table_number: u64,
+    block_cache: Option<BlockCache>,
+    fill_cache: bool,
+    block_index: usize,
+    current_block: Option<Arc<Block>>,
+    entry_index: usize,
+}
+
+impl SSTableStorageIterator {
+    fn new(
+        env: Arc<dyn Env>,
+        path: PathBuf,
+        index: Vec<IndexEntry>,
+        table_number: u64,
+        block_cache: Option<BlockCache>,
+        fill_cache: bool,
+    ) -> Result<Self> {
+        let file = env.open_readable(&path)?;
+        let mut iter = Self {
+            file,
+            index,
+            table_number,
+            block_cache,
+            fill_cache,
+            block_index: 0,
+            current_block: None,
+            entry_index: 0,
+        };
+        iter.load_block_at(0)?;
+        Ok(iter)
+    }
+
+    fn load_block_at(&mut self, index: usize) -> Result<()> {
+        self.block_index = index;
+        self.current_block = None;
+        self.entry_index = 0;
+
+        while self.block_index < self.index.len() {
+            let block = read_decoded_block(
+                self.file.as_mut(),
+                &self.index[self.block_index],
+                self.table_number,
+                self.block_cache.as_ref(),
+                self.fill_cache,
+            )?;
+            if !block.entries().is_empty() {
+                self.current_block = Some(block);
+                return Ok(());
+            }
+            self.block_index += 1;
+        }
+        Ok(())
+    }
+
+    fn advance_to_next_block(&mut self) -> Result<()> {
+        self.load_block_at(self.block_index + 1)
+    }
+}
+
+impl StorageIterator for SSTableStorageIterator {
+    fn is_valid(&self) -> bool {
+        self.current_block
+            .as_ref()
+            .is_some_and(|block| self.entry_index < block.entries().len())
+    }
+
+    fn key(&self) -> &InternalKey {
+        &self
+            .current_block
+            .as_ref()
+            .expect("valid table iterator")
+            .entries()[self.entry_index]
+            .0
+    }
+
+    fn value(&self) -> &ValueRecord {
+        &self
+            .current_block
+            .as_ref()
+            .expect("valid table iterator")
+            .entries()[self.entry_index]
+            .1
+    }
+
+    fn next(&mut self) -> Result<()> {
+        if !self.is_valid() {
+            return Ok(());
+        }
+
+        self.entry_index += 1;
+        if !self.is_valid() {
+            self.advance_to_next_block()?;
+        }
+        Ok(())
+    }
+
+    fn seek(&mut self, key: &InternalKey) -> Result<()> {
+        let block_index = self
+            .index
+            .partition_point(|entry| entry.last_key < *key)
+            .min(self.index.len());
+        self.load_block_at(block_index)?;
+        if let Some(block) = &self.current_block {
+            self.entry_index = block
+                .entries()
+                .partition_point(|(entry_key, _)| entry_key < key);
+            if self.entry_index >= block.entries().len() {
+                self.advance_to_next_block()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn read_decoded_block(
+    file: &mut dyn ReadableFile,
+    index: &IndexEntry,
+    table_number: u64,
+    block_cache: Option<&BlockCache>,
+    fill_cache: bool,
+) -> Result<Arc<Block>> {
+    if fill_cache
+        && let Some(cache) = block_cache
+        && let Some(block) = cache.get(table_number, index.handle.offset)
+    {
+        return Ok(block);
+    }
+
+    let block_bytes = read_block(file, index.handle)?;
+    let block = Arc::new(Block::decode(&block_bytes)?);
+    if fill_cache && let Some(cache) = block_cache {
+        cache.insert(table_number, index.handle.offset, Arc::clone(&block));
+    }
+    Ok(block)
 }
 
 #[derive(Debug)]

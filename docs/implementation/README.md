@@ -16,6 +16,7 @@
 | V7 | [MVCC 与事务](v7_mvcc_transactions.md) | Snapshot、水位线、乐观事务、SSI 校验 |
 | V8 | [优化与加固](v8_optimization_hardening.md) | 跳表/arena、压缩、group commit、subcompaction、基准测试、故障测试 |
 | V9 | [API 语义与 Env 边界加固](v9_api_semantics_hardening.md) | `ReadOptions.fill_cache` 语义收口、Env 读路径、使用文档修正 |
+| V10 | [流式 Scan Iterator](v10_streaming_scan_iterator.md) | 公开 `scan_iter` API、SSTable 按 block 懒加载 scan、兼容旧 `scan` |
 
 ## 规划规则
 
@@ -28,7 +29,7 @@
 ## 依赖关系
 
 ```text
-V0 -> V1 -> V2 -> V3 -> V4 -> V5 -> V6 -> V7 -> V8 -> V9
+V0 -> V1 -> V2 -> V3 -> V4 -> V5 -> V6 -> V7 -> V8 -> V9 -> V10
 ```
 
 这个顺序刻意保持线性。单个版本内部可以并行推进一部分任务，但存储格式与恢复语义必须先稳定，再让上层能力依赖它们。

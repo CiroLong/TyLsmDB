@@ -21,6 +21,7 @@ pub mod wal;
 pub use batch::{BatchRecord, WriteBatch};
 pub use db::DB;
 pub use error::{Error, Result};
+pub use iterator::DBIterator;
 pub use metrics::MetricsSnapshot;
 pub use options::{Options, ReadOptions, WalSyncMode, WriteOptions};
 pub use snapshot::Snapshot;

@@ -3,7 +3,7 @@ use std::ops::Bound;
 
 use crate::bytes::Bytes;
 use crate::error::Result;
-use crate::key::SequenceNumber;
+use crate::key::{InternalKey, SequenceNumber, ValueType};
 use crate::memtable::ValueRecord;
 
 use super::storage_iterator::StorageIterator;
@@ -24,6 +24,16 @@ impl DBIterator {
         upper: Bound<Bytes>,
         read_seq: SequenceNumber,
     ) -> Self {
+        Self::try_new(inner, lower, upper, read_seq)
+            .expect("iterator initialization should not fail")
+    }
+
+    pub fn try_new(
+        inner: Box<dyn StorageIterator>,
+        lower: Bound<Bytes>,
+        upper: Bound<Bytes>,
+        read_seq: SequenceNumber,
+    ) -> Result<Self> {
         let mut iter = Self {
             inner,
             lower,
@@ -32,9 +42,9 @@ impl DBIterator {
             seen: BTreeSet::new(),
             current: None,
         };
-        iter.advance_to_next_visible()
-            .expect("in-memory iterator advance should not fail");
-        iter
+        iter.seek_to_lower_bound()?;
+        iter.advance_to_next_visible()?;
+        Ok(iter)
     }
 
     pub fn is_valid(&self) -> bool {
@@ -92,6 +102,25 @@ impl DBIterator {
             }
         }
         Ok(())
+    }
+
+    fn seek_to_lower_bound(&mut self) -> Result<()> {
+        let Some(target) = lower_bound_seek_key(&self.lower) else {
+            return Ok(());
+        };
+        self.inner.seek(&target)
+    }
+}
+
+fn lower_bound_seek_key(lower: &Bound<Bytes>) -> Option<InternalKey> {
+    match lower {
+        Bound::Included(key) => Some(InternalKey::new(
+            key.clone(),
+            SequenceNumber::MAX,
+            ValueType::Put,
+        )),
+        Bound::Excluded(key) => Some(InternalKey::new(key.clone(), 0, ValueType::Delete)),
+        Bound::Unbounded => None,
     }
 }
 

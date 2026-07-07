@@ -342,6 +342,20 @@ impl DB {
         upper: Bound<&[u8]>,
         opts: ReadOptions,
     ) -> Result<Vec<(Bytes, Bytes)>> {
+        let mut iter = self.scan_iter_opt(lower, upper, opts)?;
+        iter.collect()
+    }
+
+    pub fn scan_iter(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<DBIterator> {
+        self.scan_iter_opt(lower, upper, ReadOptions::default())
+    }
+
+    pub fn scan_iter_opt(
+        &self,
+        lower: Bound<&[u8]>,
+        upper: Bound<&[u8]>,
+        opts: ReadOptions,
+    ) -> Result<DBIterator> {
         let (read_seq, mem_entries, l0_tables, level_tables) = {
             let state = self.read_state()?;
             if state.closed {
@@ -370,29 +384,28 @@ impl DB {
             children.push(Box::new(EntryIterator::new(mem_entries)));
         }
         for (meta, table) in &l0_tables {
-            children.push(Box::new(EntryIterator::new(table.entries_with_cache(
+            children.push(Box::new(table.storage_iter(
                 meta.number,
-                Some(&self.inner.block_cache),
+                Some(self.inner.block_cache.clone()),
                 opts.fill_cache,
-            )?)));
+            )?));
         }
         for level in &level_tables {
             for (meta, table) in level {
-                children.push(Box::new(EntryIterator::new(table.entries_with_cache(
+                children.push(Box::new(table.storage_iter(
                     meta.number,
-                    Some(&self.inner.block_cache),
+                    Some(self.inner.block_cache.clone()),
                     opts.fill_cache,
-                )?)));
+                )?));
             }
         }
 
-        let mut iter = DBIterator::new(
+        DBIterator::try_new(
             Box::new(MergeIterator::new(children)),
             bound_to_owned(lower),
             bound_to_owned(upper),
             read_seq,
-        );
-        iter.collect()
+        )
     }
 
     pub fn snapshot(&self) -> Snapshot {
