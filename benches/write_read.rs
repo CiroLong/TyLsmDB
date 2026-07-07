@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use tylsmdb::memtable::MemTableKind;
 use tylsmdb::table::format::CompressionType;
 use tylsmdb::{DB, Options, WriteOptions};
@@ -122,6 +122,75 @@ fn bench_flush_and_compaction(c: &mut Criterion) {
     });
 }
 
+fn bench_amplification_metrics(c: &mut Criterion) {
+    let report = build_amplification_report();
+    fs::write(
+        "target/tylsmdb-benches/amplification_metrics.txt",
+        report.text.clone(),
+    )
+    .expect("write amplification report");
+
+    c.bench_function("amplification_metrics", |b| {
+        b.iter(|| black_box(report.write_amplification + report.read_amplification));
+    });
+}
+
+#[derive(Clone)]
+struct AmplificationReport {
+    text: String,
+    write_amplification: f64,
+    read_amplification: f64,
+}
+
+fn build_amplification_report() -> AmplificationReport {
+    let db = fresh_db("amplification_metrics");
+    for round in 0..3 {
+        for index in 0..32 {
+            let key = format!("amp-{index:04}");
+            let value = format!("value-{round}-{index}");
+            db.put(key.as_bytes(), value.as_bytes()).expect("put");
+        }
+        db.flush().expect("flush");
+    }
+    db.compact_range(Unbounded, Unbounded).expect("compact");
+    for index in 0..32 {
+        let key = format!("amp-{index:04}");
+        assert!(db.get(key.as_bytes()).expect("get").is_some());
+    }
+
+    let metrics = db.metrics_snapshot();
+    let user_write_bytes = metrics.user_write_bytes.max(1) as f64;
+    let write_bytes =
+        metrics.wal_write_bytes + metrics.sst_write_bytes + metrics.compaction_write_bytes;
+    let read_bytes =
+        metrics.compaction_read_bytes + metrics.block_cache_misses * db.options().block_size as u64;
+    let write_amplification = write_bytes as f64 / user_write_bytes;
+    let read_amplification = read_bytes as f64 / user_write_bytes;
+    let text = format!(
+        "\
+user_write_bytes={}\n\
+wal_write_bytes={}\n\
+sst_write_bytes={}\n\
+compaction_read_bytes={}\n\
+compaction_write_bytes={}\n\
+block_cache_misses={}\n\
+write_amplification={write_amplification:.4}\n\
+read_amplification={read_amplification:.4}\n",
+        metrics.user_write_bytes,
+        metrics.wal_write_bytes,
+        metrics.sst_write_bytes,
+        metrics.compaction_read_bytes,
+        metrics.compaction_write_bytes,
+        metrics.block_cache_misses,
+    );
+
+    AmplificationReport {
+        text,
+        write_amplification,
+        read_amplification,
+    }
+}
+
 fn fresh_db(name: &str) -> DB {
     static NEXT_BENCH_ID: AtomicU64 = AtomicU64::new(0);
     let id = NEXT_BENCH_ID.fetch_add(1, Ordering::Relaxed);
@@ -156,6 +225,7 @@ criterion_group! {
         bench_point_lookup_miss,
         bench_range_scan,
         bench_wal_sync_write,
-        bench_flush_and_compaction
+        bench_flush_and_compaction,
+        bench_amplification_metrics
 }
 criterion_main!(benches);

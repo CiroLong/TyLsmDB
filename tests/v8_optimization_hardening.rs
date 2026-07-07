@@ -1,10 +1,13 @@
 use std::fs;
 use std::ops::Bound::{Included, Unbounded};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::Duration;
 
 use tylsmdb::memtable::MemTableKind;
 use tylsmdb::table::format::CompressionType;
-use tylsmdb::{DB, Options};
+use tylsmdb::{DB, Options, WalSyncMode};
 
 fn fresh_dir(name: &str) -> PathBuf {
     let path = PathBuf::from("target/tylsmdb-tests").join(name);
@@ -120,6 +123,76 @@ fn metrics_track_write_wal_sst_and_cache_activity() {
 }
 
 #[test]
+fn bloom_metrics_record_useful_negative_filter_results() {
+    let path = fresh_dir("bloom_metrics_record_useful_negative_filter_results");
+    let db = DB::open(
+        &path,
+        Options {
+            block_size: 128,
+            ..Options::default()
+        },
+    )
+    .expect("open db");
+
+    db.put(b"a", b"1").expect("put a");
+    db.put(b"z", b"2").expect("put z");
+    db.flush().expect("flush");
+
+    assert_eq!(db.get(b"m").expect("missing get"), None);
+
+    let metrics = db.metrics_snapshot();
+    assert!(metrics.bloom_useful > 0);
+}
+
+#[test]
+fn group_commit_batches_concurrent_sync_writes() {
+    let path = fresh_dir("group_commit_batches_concurrent_sync_writes");
+    let db = Arc::new(
+        DB::open(
+            &path,
+            Options {
+                wal_sync: WalSyncMode::PerWrite,
+                write_group_max_delay: Duration::from_millis(5),
+                ..Options::default()
+            },
+        )
+        .expect("open db"),
+    );
+    let writers = 8;
+    let barrier = Arc::new(Barrier::new(writers));
+    let mut handles = Vec::new();
+
+    for index in 0..writers {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            let key = format!("group-{index:02}");
+            db.put(key.as_bytes(), b"value").expect("put");
+        }));
+    }
+
+    for handle in handles {
+        handle.join().expect("writer thread joins");
+    }
+
+    for index in 0..writers {
+        let key = format!("group-{index:02}");
+        assert_eq!(
+            db.get(key.as_bytes()).expect("get"),
+            Some(b"value".to_vec())
+        );
+    }
+
+    let metrics = db.metrics_snapshot();
+    assert!(metrics.wal_sync_count > 0);
+    assert!(
+        metrics.wal_sync_count < writers as u64,
+        "group commit should sync fewer times than the number of concurrent writers"
+    );
+}
+
+#[test]
 fn rate_limiter_reports_wait_when_budget_is_exhausted() {
     let limiter = tylsmdb::util::rate_limiter::RateLimiter::new(10);
 
@@ -133,7 +206,7 @@ fn rate_limiter_reports_wait_when_budget_is_exhausted() {
 }
 
 #[test]
-fn manual_compaction_with_small_subcompaction_budget_keeps_sorted_results() {
+fn parallel_subcompaction_records_multiple_tasks_and_keeps_sorted_results() {
     let path = fresh_dir("manual_compaction_with_small_subcompaction_budget");
     let db = DB::open(
         &path,
@@ -161,6 +234,10 @@ fn manual_compaction_with_small_subcompaction_budget_keeps_sorted_results() {
     assert_eq!(rows.len(), 20);
     assert_eq!(rows.first().expect("first").0, b"k-000".to_vec());
     assert_eq!(rows.last().expect("last").0, b"k-019".to_vec());
+
+    let metrics = db.metrics_snapshot();
+    assert!(metrics.subcompaction_tasks > 1);
+    assert!(metrics.max_subcompaction_parallelism > 1);
 }
 
 fn total_sst_bytes(path: &Path) -> u64 {

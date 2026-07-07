@@ -1,8 +1,8 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::mem;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -44,6 +44,7 @@ struct DBInner {
     watermark: Arc<Watermark>,
     metrics: Metrics,
     write_rate_limiter: Option<RateLimiter>,
+    write_group: Mutex<VecDeque<Arc<PendingWrite>>>,
     wal: Mutex<WalWriter>,
 }
 
@@ -63,6 +64,64 @@ type TableRef = (FileMeta, Arc<SSTableReader>);
 enum FlushSource {
     Mutable,
     ImmutableOldest,
+}
+
+#[derive(Debug)]
+struct PendingWrite {
+    batch: Mutex<Option<WriteBatch>>,
+    opts: WriteOptions,
+    result: Mutex<Option<Result<()>>>,
+    done: Condvar,
+}
+
+impl PendingWrite {
+    fn new(batch: WriteBatch, opts: WriteOptions) -> Self {
+        Self {
+            batch: Mutex::new(Some(batch)),
+            opts,
+            result: Mutex::new(None),
+            done: Condvar::new(),
+        }
+    }
+
+    fn take_batch(&self) -> WriteBatch {
+        self.batch
+            .lock()
+            .expect("pending write batch lock poisoned")
+            .take()
+            .expect("pending write batch is present")
+    }
+
+    fn complete(&self, result: Result<()>) {
+        *self
+            .result
+            .lock()
+            .expect("pending write result lock poisoned") = Some(result);
+        self.done.notify_one();
+    }
+
+    fn wait(&self) -> Result<()> {
+        let mut result = self
+            .result
+            .lock()
+            .expect("pending write result lock poisoned");
+        loop {
+            if let Some(result) = result.take() {
+                return result;
+            }
+            result = self
+                .done
+                .wait(result)
+                .expect("pending write condvar wait poisoned");
+        }
+    }
+}
+
+struct GroupWriteItem {
+    batch: WriteBatch,
+    opts: WriteOptions,
+    user_write_bytes: u64,
+    start_sequence: SequenceNumber,
 }
 
 impl DB {
@@ -119,6 +178,7 @@ impl DB {
                 watermark,
                 metrics: Metrics::new(),
                 write_rate_limiter,
+                write_group: Mutex::new(VecDeque::new()),
                 wal: Mutex::new(wal),
             }),
         })
@@ -155,43 +215,40 @@ impl DB {
             return Ok(());
         }
 
-        let user_write_bytes = batch_user_write_bytes(&batch);
-        self.inner.metrics.record_user_write(user_write_bytes);
-        self.apply_write_rate_limit(user_write_bytes);
-        self.apply_write_pressure()?;
-
-        let should_flush = {
-            let mut state = self.write_state()?;
-            if state.closed {
-                return Err(Error::Closed);
-            }
-
-            let start_sequence = state.last_sequence + 1;
-            if self.inner.options.wal_enabled && !opts.disable_wal {
-                let payload = batch.encode_with_sequence(start_sequence);
-                self.inner
-                    .metrics
-                    .record_wal_write(wal_record_bytes(&payload));
-                let mut wal = self.write_wal()?;
-                wal.append(&payload)?;
-                if opts.sync || self.inner.options.wal_sync == WalSyncMode::PerWrite {
-                    wal.sync()?;
-                }
-            }
-
-            apply_batch(&mut state, start_sequence, &batch);
-            freeze_mutable_if_needed(
-                &mut state,
-                self.inner.options.memtable_size,
-                self.inner.options.memtable_kind,
-            )
+        let should_wait_for_group =
+            opts.sync || self.inner.options.wal_sync == WalSyncMode::PerWrite;
+        let request = Arc::new(PendingWrite::new(batch, opts));
+        let is_leader = {
+            let mut group = self
+                .inner
+                .write_group
+                .lock()
+                .expect("write group lock poisoned");
+            let is_leader = group.is_empty();
+            group.push_back(Arc::clone(&request));
+            is_leader
         };
 
-        if should_flush {
-            self.flush()?;
+        if !is_leader {
+            return request.wait();
         }
 
-        Ok(())
+        if should_wait_for_group {
+            thread::sleep(self.inner.options.write_group_max_delay);
+        }
+        let requests = {
+            let mut group = self
+                .inner
+                .write_group
+                .lock()
+                .expect("write group lock poisoned");
+            group.drain(..).collect::<Vec<_>>()
+        };
+        let results = self.apply_write_group(&requests);
+        for (request, result) in requests.iter().zip(results) {
+            request.complete(result);
+        }
+        request.wait()
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Bytes>> {
@@ -231,6 +288,10 @@ impl DB {
             if !file_overlaps_user_key(meta, key) {
                 continue;
             }
+            if !table.might_contain(key) {
+                self.inner.metrics.record_bloom_useful();
+                continue;
+            }
             if let Some(record) = table.get_with_cache(
                 key,
                 read_seq,
@@ -239,6 +300,8 @@ impl DB {
                 fill_cache,
             )? {
                 return Ok(record.into_visible_value());
+            } else {
+                self.inner.metrics.record_bloom_false_positive();
             }
         }
 
@@ -249,6 +312,10 @@ impl DB {
             else {
                 continue;
             };
+            if !table.might_contain(key) {
+                self.inner.metrics.record_bloom_useful();
+                continue;
+            }
             if let Some(record) = table.get_with_cache(
                 key,
                 read_seq,
@@ -257,6 +324,8 @@ impl DB {
                 fill_cache,
             )? {
                 return Ok(record.into_visible_value());
+            } else {
+                self.inner.metrics.record_bloom_false_positive();
             }
         }
         Ok(None)
@@ -378,6 +447,7 @@ impl DB {
                 wal.append(&payload)?;
                 if self.inner.options.wal_sync == WalSyncMode::PerWrite {
                     wal.sync()?;
+                    self.inner.metrics.record_wal_sync();
                 }
             }
 
@@ -440,7 +510,9 @@ impl DB {
     }
 
     pub fn sync_wal(&self) -> Result<()> {
-        self.write_wal()?.sync()
+        self.write_wal()?.sync()?;
+        self.inner.metrics.record_wal_sync();
+        Ok(())
     }
 
     pub fn block_cache_stats(&self) -> CacheStats {
@@ -676,6 +748,85 @@ impl DB {
         }
     }
 
+    fn apply_write_group(&self, requests: &[Arc<PendingWrite>]) -> Vec<Result<()>> {
+        let mut items = requests
+            .iter()
+            .map(|request| {
+                let batch = request.take_batch();
+                let user_write_bytes = batch_user_write_bytes(&batch);
+                GroupWriteItem {
+                    batch,
+                    opts: request.opts,
+                    user_write_bytes,
+                    start_sequence: 0,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let total_user_write_bytes = items.iter().map(|item| item.user_write_bytes).sum();
+        self.inner.metrics.record_user_write(total_user_write_bytes);
+        self.apply_write_rate_limit(total_user_write_bytes);
+        if let Err(err) = self.apply_write_pressure() {
+            return repeat_group_error(err, requests.len());
+        }
+
+        let should_flush = match self.apply_write_group_to_memtable(&mut items) {
+            Ok(should_flush) => should_flush,
+            Err(err) => return repeat_group_error(err, requests.len()),
+        };
+
+        if should_flush && let Err(err) = self.flush() {
+            return repeat_group_error(err, requests.len());
+        }
+
+        (0..requests.len()).map(|_| Ok(())).collect()
+    }
+
+    fn apply_write_group_to_memtable(&self, items: &mut [GroupWriteItem]) -> Result<bool> {
+        let mut state = self.write_state()?;
+        if state.closed {
+            return Err(Error::Closed);
+        }
+
+        let mut next_sequence = state.last_sequence + 1;
+        for item in items.iter_mut() {
+            item.start_sequence = next_sequence;
+            next_sequence += item.batch.records().len() as u64;
+        }
+
+        let mut should_sync = false;
+        if self.inner.options.wal_enabled {
+            let mut wal = self.write_wal()?;
+            for item in items.iter() {
+                if item.opts.disable_wal {
+                    continue;
+                }
+                let payload = item.batch.encode_with_sequence(item.start_sequence);
+                self.inner
+                    .metrics
+                    .record_wal_write(wal_record_bytes(&payload));
+                wal.append(&payload)?;
+                should_sync |=
+                    item.opts.sync || self.inner.options.wal_sync == WalSyncMode::PerWrite;
+            }
+            if should_sync {
+                wal.sync()?;
+                self.inner.metrics.record_wal_sync();
+            }
+        }
+
+        let mut should_flush = false;
+        for item in items {
+            apply_batch(&mut state, item.start_sequence, &item.batch);
+            should_flush |= freeze_mutable_if_needed(
+                &mut state,
+                self.inner.options.memtable_size,
+                self.inner.options.memtable_kind,
+            );
+        }
+        Ok(should_flush)
+    }
+
     fn execute_compaction(&self, task: CompactionTask) -> Result<bool> {
         if task.input_files.is_empty() {
             return Ok(false);
@@ -795,12 +946,36 @@ impl DB {
             self.inner.options.target_file_size_base,
             self.inner.options.max_subcompactions,
         );
-        let mut outputs = Vec::with_capacity(chunks.len());
-        for chunk in chunks {
+        self.inner
+            .metrics
+            .record_subcompaction_tasks(chunks.len() as u64);
+
+        if chunks.len() == 1 {
             let number = self.allocate_file_number()?;
-            outputs.push(self.write_compaction_output(number, chunk)?);
+            return Ok(vec![self.write_compaction_output(
+                number,
+                chunks.into_iter().next().expect("one chunk"),
+            )?]);
         }
-        Ok(outputs)
+
+        thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(chunks.len());
+            for chunk in chunks {
+                handles.push(scope.spawn(move || {
+                    let number = self.allocate_file_number()?;
+                    self.write_compaction_output(number, chunk)
+                }));
+            }
+
+            let mut outputs = Vec::with_capacity(handles.len());
+            for handle in handles {
+                let output = handle.join().map_err(|_| {
+                    Error::Corruption("subcompaction worker panicked".to_string())
+                })??;
+                outputs.push(output);
+            }
+            Ok(outputs)
+        })
     }
 
     fn write_compaction_output(
@@ -1049,6 +1224,30 @@ fn batch_user_write_bytes(batch: &WriteBatch) -> u64 {
 
 fn wal_record_bytes(payload: &[u8]) -> u64 {
     payload.len() as u64 + 9
+}
+
+fn repeat_group_error(err: Error, count: usize) -> Vec<Result<()>> {
+    match err {
+        Error::Closed => (0..count).map(|_| Err(Error::Closed)).collect(),
+        Error::InvalidArgument(message) => (0..count)
+            .map(|_| Err(Error::InvalidArgument(message.clone())))
+            .collect(),
+        Error::Corruption(message) => (0..count)
+            .map(|_| Err(Error::Corruption(message.clone())))
+            .collect(),
+        Error::Unsupported(feature) => (0..count)
+            .map(|_| Err(Error::Unsupported(feature)))
+            .collect(),
+        Error::TransactionConflict(message) => (0..count)
+            .map(|_| Err(Error::TransactionConflict(message.clone())))
+            .collect(),
+        Error::Io(err) => {
+            let message = err.to_string();
+            (0..count)
+                .map(|_| Err(Error::Corruption(message.clone())))
+                .collect()
+        }
+    }
 }
 
 fn split_compaction_entries(
