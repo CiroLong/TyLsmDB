@@ -149,7 +149,7 @@ impl DB {
             VersionSet::create(&path, options_for_versions)?
         };
         let block_cache = BlockCache::new(options.block_cache_capacity);
-        let table_cache = TableCache::new(512);
+        let table_cache = TableCache::new_with_env(512, Arc::clone(&env));
         let watermark = Arc::new(Watermark::new());
         let (l0_tables, level_tables) =
             open_version_tables(&path, versions.current().as_ref(), &table_cache)?;
@@ -162,8 +162,8 @@ impl DB {
             closed: false,
         };
         let wal_path = path.join(wal_file_name(versions.log_number()));
-        if wal_path.exists() {
-            recover_wal(&wal_path, &mut state)?;
+        if env.exists(&wal_path) {
+            recover_wal(env.as_ref(), &wal_path, &mut state)?;
         }
         let wal = WalWriter::create_with_env(env.as_ref(), &wal_path)?;
         let write_rate_limiter = options.write_rate_limit_bytes_per_sec.map(RateLimiter::new);
@@ -370,15 +370,19 @@ impl DB {
             children.push(Box::new(EntryIterator::new(mem_entries)));
         }
         for (meta, table) in &l0_tables {
-            children.push(Box::new(EntryIterator::new(
-                table.entries_with_cache(meta.number, Some(&self.inner.block_cache))?,
-            )));
+            children.push(Box::new(EntryIterator::new(table.entries_with_cache(
+                meta.number,
+                Some(&self.inner.block_cache),
+                opts.fill_cache,
+            )?)));
         }
         for level in &level_tables {
             for (meta, table) in level {
-                children.push(Box::new(EntryIterator::new(
-                    table.entries_with_cache(meta.number, Some(&self.inner.block_cache))?,
-                )));
+                children.push(Box::new(EntryIterator::new(table.entries_with_cache(
+                    meta.number,
+                    Some(&self.inner.block_cache),
+                    opts.fill_cache,
+                )?)));
             }
         }
 
@@ -649,7 +653,9 @@ impl DB {
             if meta.largest_seq <= read_seq {
                 continue;
             }
-            for (key, _) in table.entries_with_cache(meta.number, Some(&self.inner.block_cache))? {
+            for (key, _) in
+                table.entries_with_cache(meta.number, Some(&self.inner.block_cache), true)?
+            {
                 if key.sequence() > read_seq && predicate(&key) {
                     return Ok(true);
                 }
@@ -661,7 +667,7 @@ impl DB {
                     continue;
                 }
                 for (key, _) in
-                    table.entries_with_cache(meta.number, Some(&self.inner.block_cache))?
+                    table.entries_with_cache(meta.number, Some(&self.inner.block_cache), true)?
                 {
                     if key.sequence() > read_seq && predicate(&key) {
                         return Ok(true);
@@ -685,7 +691,7 @@ impl DB {
         let table_name = table_file_name(file_number);
         let tmp_path = self.inner.path.join(format!("{table_name}.tmp"));
         let final_path = self.inner.path.join(table_name);
-        if final_path.exists() {
+        if self.inner.options.env.exists(&final_path) {
             return Err(Error::Corruption(format!(
                 "table file already exists: {}",
                 final_path.display()
@@ -870,7 +876,11 @@ impl DB {
                 file.number,
                 &self.inner.path.join(table_file_name(file.number)),
             )?;
-            entries.extend(table.entries_with_cache(file.number, Some(&self.inner.block_cache))?);
+            entries.extend(table.entries_with_cache(
+                file.number,
+                Some(&self.inner.block_cache),
+                true,
+            )?);
         }
 
         let output_entries = compact_entries(entries, gc_watermark, drop_tombstones);
@@ -917,7 +927,7 @@ impl DB {
             file.number,
             &self.inner.path.join(table_file_name(file.number)),
         )?;
-        let entries = table.entries_with_cache(file.number, Some(&self.inner.block_cache))?;
+        let entries = table.entries_with_cache(file.number, Some(&self.inner.block_cache), true)?;
         let compacted_entries = compact_entries(entries.clone(), gc_watermark, drop_tombstones);
         Ok(compacted_entries.len() != entries.len())
     }
@@ -1098,8 +1108,8 @@ fn extend_memtable_entries(entries: &mut Vec<(InternalKey, ValueRecord)>, memtab
     entries.extend(memtable.entries());
 }
 
-fn recover_wal(path: &Path, state: &mut DBState) -> Result<()> {
-    let mut reader = WalReader::open(path)?;
+fn recover_wal(env: &dyn crate::env::Env, path: &Path, state: &mut DBState) -> Result<()> {
+    let mut reader = WalReader::open_with_env(env, path)?;
     while let Some(payload) = reader.read_record()? {
         let (start_sequence, batch) = WriteBatch::decode_payload(&payload)?;
         apply_batch(state, start_sequence, &batch);

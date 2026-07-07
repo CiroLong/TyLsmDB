@@ -430,7 +430,7 @@ fn throttled_open() -> Result<DB> {
 - `table_compression`：选择 `CompressionType::None` 或 `CompressionType::Zstd`。
 - `write_rate_limit_bytes_per_sec`：写入前按用户 key/value 字节数限流。
 - `max_subcompactions`：compaction 输出可拆分的 chunk 数量上限。
-- `env`：文件系统抽象，测试可注入故障 env。
+- `env`：文件系统抽象，DB 内部 WAL/MANIFEST/SSTable 读写路径都可通过它注入测试 env。
 
 当前存在但没有直接影响主路径行为的字段：
 

@@ -1,5 +1,5 @@
 use std::fs;
-use std::ops::Bound::{Excluded, Included};
+use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
 
 use tylsmdb::env::file::table_file_name;
@@ -8,7 +8,7 @@ use tylsmdb::key::{InternalKey, ValueType};
 use tylsmdb::memtable::ValueRecord;
 use tylsmdb::table::{SSTableBuilder, SSTableReader};
 use tylsmdb::version::{FileMeta, VersionEdit, VersionSet};
-use tylsmdb::{DB, Options};
+use tylsmdb::{DB, Options, ReadOptions};
 
 fn fresh_dir(name: &str) -> PathBuf {
     let path = PathBuf::from("target/tylsmdb-tests").join(name);
@@ -150,6 +150,38 @@ fn block_cache_records_hits_after_repeated_get() {
     let after_second = db.block_cache_stats();
 
     assert!(after_second.hits > after_first.hits);
+}
+
+#[test]
+fn scan_with_fill_cache_false_does_not_populate_block_cache() {
+    let path = fresh_dir("scan_with_fill_cache_false_does_not_populate_block_cache");
+    let db = DB::open(&path, Options::default()).expect("open db");
+
+    db.put(b"scan-cache-key", b"scan-cache-value").expect("put");
+    db.flush().expect("flush table");
+
+    let before_scan = db.block_cache_stats();
+    assert_eq!(
+        db.scan_opt(
+            Unbounded,
+            Unbounded,
+            ReadOptions {
+                fill_cache: false,
+                ..ReadOptions::default()
+            },
+        )
+        .expect("scan without filling cache"),
+        vec![(b"scan-cache-key".to_vec(), b"scan-cache-value".to_vec())]
+    );
+    let after_scan = db.block_cache_stats();
+    assert_eq!(after_scan, before_scan);
+
+    assert_eq!(
+        db.get(b"scan-cache-key").expect("get after scan"),
+        Some(b"scan-cache-value".to_vec())
+    );
+    let after_get = db.block_cache_stats();
+    assert!(after_get.misses > after_scan.misses);
 }
 
 fn install_level_table(path: &Path, level: usize, entries: Vec<(InternalKey, ValueRecord)>) {

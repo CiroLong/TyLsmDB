@@ -1,6 +1,6 @@
 use std::fmt::Debug;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use crate::error::{Error, Result};
@@ -41,6 +41,17 @@ pub trait WritableFile: Debug + Send {
     fn sync_all(&mut self) -> Result<()>;
 }
 
+pub trait ReadableFile: Debug + Send {
+    fn read(&mut self, dst: &mut [u8]) -> Result<usize>;
+    fn read_exact(&mut self, dst: &mut [u8]) -> Result<()>;
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64>;
+    fn len(&self) -> Result<u64>;
+
+    fn is_empty(&self) -> Result<bool> {
+        Ok(self.len()? == 0)
+    }
+}
+
 pub trait Env: Debug + Send + Sync {
     fn create_dir_all(&self, path: &Path) -> Result<()>;
     fn exists(&self, path: &Path) -> bool;
@@ -49,6 +60,7 @@ pub trait Env: Debug + Send + Sync {
         path: &Path,
         options: WritableFileOptions,
     ) -> Result<Box<dyn WritableFile>>;
+    fn open_readable(&self, path: &Path) -> Result<Box<dyn ReadableFile>>;
     fn read_to_string(&self, path: &Path) -> Result<String>;
     fn rename(&self, from: &Path, to: &Path) -> Result<()>;
     fn metadata_len(&self, path: &Path) -> Result<u64>;
@@ -82,6 +94,12 @@ impl Env for FsEnv {
             .read(options.read)
             .open(path)?;
         Ok(Box::new(FsWritableFile { file }))
+    }
+
+    fn open_readable(&self, path: &Path) -> Result<Box<dyn ReadableFile>> {
+        Ok(Box::new(FsReadableFile {
+            file: File::open(path)?,
+        }))
     }
 
     fn read_to_string(&self, path: &Path) -> Result<String> {
@@ -121,6 +139,30 @@ impl WritableFile for FsWritableFile {
     fn sync_all(&mut self) -> Result<()> {
         self.file.sync_all()?;
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct FsReadableFile {
+    file: File,
+}
+
+impl ReadableFile for FsReadableFile {
+    fn read(&mut self, dst: &mut [u8]) -> Result<usize> {
+        Ok(self.file.read(dst)?)
+    }
+
+    fn read_exact(&mut self, dst: &mut [u8]) -> Result<()> {
+        self.file.read_exact(dst)?;
+        Ok(())
+    }
+
+    fn seek(&mut self, pos: SeekFrom) -> Result<u64> {
+        Ok(self.file.seek(pos)?)
+    }
+
+    fn len(&self) -> Result<u64> {
+        Ok(self.file.metadata()?.len())
     }
 }
 

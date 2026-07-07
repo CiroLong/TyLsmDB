@@ -1,11 +1,10 @@
-use std::path::Path;
-
 use crate::env::{Env, FsEnv, WritableFile, WritableFileOptions};
 use crate::error::Result;
 use crate::util::crc::crc32c;
 use crate::version::edit::VersionEdit;
 use crate::wal::WalReader;
 use crate::wal::format::WalRecordType;
+use std::path::Path;
 
 #[derive(Debug)]
 pub struct ManifestWriter {
@@ -57,8 +56,13 @@ pub struct ManifestReader {
 
 impl ManifestReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let env = FsEnv;
+        Self::open_with_env(&env, path)
+    }
+
+    pub fn open_with_env(env: &dyn Env, path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
-            reader: WalReader::open(path)?,
+            reader: WalReader::open_with_env(env, path)?,
         })
     }
 

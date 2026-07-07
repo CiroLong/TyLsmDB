@@ -1,26 +1,30 @@
-use std::fs::File;
-use std::io::{ErrorKind, Read};
 use std::path::Path;
 
+use crate::env::{Env, FsEnv, ReadableFile};
 use crate::error::{Error, Result};
 use crate::util::crc::crc32c;
 use crate::wal::format::{WAL_RECORD_HEADER_SIZE, WalRecordType};
 
 #[derive(Debug)]
 pub struct WalReader {
-    file: File,
+    file: Box<dyn ReadableFile>,
 }
 
 impl WalReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let env = FsEnv;
+        Self::open_with_env(&env, path)
+    }
+
+    pub fn open_with_env(env: &dyn Env, path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
-            file: File::open(path)?,
+            file: env.open_readable(path.as_ref())?,
         })
     }
 
     pub fn read_record(&mut self) -> Result<Option<Vec<u8>>> {
         let mut header = [0_u8; WAL_RECORD_HEADER_SIZE];
-        if !read_exact_or_eof(&mut self.file, &mut header)? {
+        if !read_exact_or_eof(self.file.as_mut(), &mut header)? {
             return Ok(None);
         }
 
@@ -29,7 +33,7 @@ impl WalReader {
         let record_type = WalRecordType::from_u8(header[8])?;
 
         let mut payload = vec![0_u8; payload_len];
-        if !read_exact_or_eof(&mut self.file, &mut payload)? {
+        if !read_exact_or_eof(self.file.as_mut(), &mut payload)? {
             return Ok(None);
         }
 
@@ -45,7 +49,7 @@ impl WalReader {
     }
 }
 
-fn read_exact_or_eof(file: &mut File, mut dst: &mut [u8]) -> Result<bool> {
+fn read_exact_or_eof(file: &mut dyn ReadableFile, mut dst: &mut [u8]) -> Result<bool> {
     let mut read_any = false;
     while !dst.is_empty() {
         match file.read(dst) {
@@ -55,8 +59,7 @@ fn read_exact_or_eof(file: &mut File, mut dst: &mut [u8]) -> Result<bool> {
                 let rest = dst.split_at_mut(n).1;
                 dst = rest;
             }
-            Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(false),
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(err),
         }
     }
     Ok(read_any)

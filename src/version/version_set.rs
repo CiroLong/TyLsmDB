@@ -70,7 +70,7 @@ impl VersionSet {
             manifest_writer: None,
         };
 
-        let mut reader = ManifestReader::open(&manifest_path)?;
+        let mut reader = ManifestReader::open_with_env(options.env.as_ref(), &manifest_path)?;
         for edit in reader.read_all()? {
             versions.apply_edit(edit)?;
         }

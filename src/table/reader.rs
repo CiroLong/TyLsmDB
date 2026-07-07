@@ -1,9 +1,9 @@
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::cache::BlockCache;
+use crate::env::{Env, FsEnv, ReadableFile};
 use crate::error::{Error, Result};
 use crate::key::InternalKey;
 use crate::memtable::ValueRecord;
@@ -21,6 +21,7 @@ use crate::util::crc::crc32c;
 #[derive(Debug)]
 pub struct SSTableReader {
     path: PathBuf,
+    env: Arc<dyn Env>,
     index: Vec<IndexEntry>,
     properties: TableProperties,
     filter: TableFilter,
@@ -28,9 +29,13 @@ pub struct SSTableReader {
 
 impl SSTableReader {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_env(Arc::new(FsEnv), path)
+    }
+
+    pub fn open_with_env(env: Arc<dyn Env>, path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let mut file = File::open(&path)?;
-        let file_len = file.metadata()?.len();
+        let mut file = env.open_readable(&path)?;
+        let file_len = file.len()?;
         if file_len < FOOTER_SIZE as u64 {
             return Err(Error::Corruption("SSTable is too small".to_string()));
         }
@@ -39,13 +44,14 @@ impl SSTableReader {
         file.read_exact(&mut footer)?;
         let (properties_handle, index_handle) = decode_footer(&footer)?;
 
-        let properties_block = read_block(&mut file, properties_handle)?;
+        let properties_block = read_block(file.as_mut(), properties_handle)?;
         let properties = TableProperties::decode(&properties_block)?;
-        let index_block = read_block(&mut file, index_handle)?;
+        let index_block = read_block(file.as_mut(), index_handle)?;
         let index = decode_index_entries(&index_block)?;
 
         Ok(Self {
             path,
+            env,
             index,
             filter: TableFilter::decode(&properties.filter),
             properties,
@@ -68,13 +74,18 @@ impl SSTableReader {
             return Ok(None);
         }
 
-        let mut file = File::open(&self.path)?;
+        let mut file = self.env.open_readable(&self.path)?;
         for index in &self.index {
             if !index_may_contain_user_key(index, user_key) {
                 continue;
             }
-            let block =
-                self.read_decoded_block(&mut file, index, table_number, block_cache, fill_cache)?;
+            let block = self.read_decoded_block(
+                file.as_mut(),
+                index,
+                table_number,
+                block_cache,
+                fill_cache,
+            )?;
             for (key, value) in block.entries() {
                 if key.user_key() == user_key && key.sequence() <= read_seq {
                     return Ok(Some(value.clone()));
@@ -104,19 +115,25 @@ impl SSTableReader {
     }
 
     pub(crate) fn entries(&self) -> Result<Vec<(InternalKey, ValueRecord)>> {
-        self.entries_with_cache(0, None)
+        self.entries_with_cache(0, None, true)
     }
 
     pub(crate) fn entries_with_cache(
         &self,
         table_number: u64,
         block_cache: Option<&BlockCache>,
+        fill_cache: bool,
     ) -> Result<Vec<(InternalKey, ValueRecord)>> {
-        let mut file = File::open(&self.path)?;
+        let mut file = self.env.open_readable(&self.path)?;
         let mut entries = Vec::new();
         for index in &self.index {
-            let block =
-                self.read_decoded_block(&mut file, index, table_number, block_cache, true)?;
+            let block = self.read_decoded_block(
+                file.as_mut(),
+                index,
+                table_number,
+                block_cache,
+                fill_cache,
+            )?;
             entries.extend_from_slice(block.entries());
         }
         Ok(entries)
@@ -124,7 +141,7 @@ impl SSTableReader {
 
     fn read_decoded_block(
         &self,
-        file: &mut File,
+        file: &mut dyn ReadableFile,
         index: &IndexEntry,
         table_number: u64,
         block_cache: Option<&BlockCache>,
@@ -164,7 +181,7 @@ impl Iterator for TableIterator {
     }
 }
 
-pub(crate) fn read_block(file: &mut File, handle: BlockHandle) -> Result<Vec<u8>> {
+pub(crate) fn read_block(file: &mut dyn ReadableFile, handle: BlockHandle) -> Result<Vec<u8>> {
     file.seek(SeekFrom::Start(handle.offset))?;
     let mut block = vec![0_u8; handle.size as usize];
     file.read_exact(&mut block)?;

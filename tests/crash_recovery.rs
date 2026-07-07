@@ -2,9 +2,12 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::ops::Bound::Unbounded;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
-use tylsmdb::env::{Env, FsEnv, WritableFile, WritableFileOptions};
+use tylsmdb::env::{Env, FsEnv, ReadableFile, WritableFile, WritableFileOptions};
 use tylsmdb::memtable::MemTableKind;
 use tylsmdb::table::format::CompressionType;
 use tylsmdb::{DB, Options, WriteOptions};
@@ -237,6 +240,28 @@ fn injected_current_rename_failures_are_recoverable() {
     }
 }
 
+#[test]
+fn injected_env_is_used_for_recovery_and_table_reads() {
+    let path = fresh_dir("injected_env_is_used_for_recovery_and_table_reads");
+    {
+        let db = DB::open(&path, test_options()).expect("open db");
+        db.put(b"env-read", b"value").expect("put");
+        db.flush().expect("flush table");
+        db.sync_wal().expect("sync wal");
+    }
+
+    let env = Arc::new(FaultEnv::default());
+    let reopened = DB::open(&path, test_options_with_env(env.clone())).expect("reopen with env");
+    assert_eq!(
+        reopened.get(b"env-read").expect("get via injected env"),
+        Some(b"value".to_vec())
+    );
+    assert!(
+        env.read_open_count() > 0,
+        "recovery and table reads should open readable files through Options.env"
+    );
+}
+
 fn test_options_with_env(env: Arc<dyn Env>) -> Options {
     Options {
         env,
@@ -280,6 +305,7 @@ enum FaultPoint {
 struct FaultEnv {
     fs: FsEnv,
     armed: Arc<Mutex<Option<FaultPoint>>>,
+    read_opens: Arc<AtomicU64>,
 }
 
 impl FaultEnv {
@@ -289,6 +315,10 @@ impl FaultEnv {
 
     fn take_matching(&self, path: &std::path::Path, event: FaultEvent) -> Option<FaultPoint> {
         take_matching_fault(&self.armed, path, event)
+    }
+
+    fn read_open_count(&self) -> u64 {
+        self.read_opens.load(Ordering::Relaxed)
     }
 }
 
@@ -311,6 +341,11 @@ impl Env for FaultEnv {
             inner: self.fs.open_writable(path, options)?,
             armed: Arc::clone(&self.armed),
         }))
+    }
+
+    fn open_readable(&self, path: &std::path::Path) -> tylsmdb::Result<Box<dyn ReadableFile>> {
+        self.read_opens.fetch_add(1, Ordering::Relaxed);
+        self.fs.open_readable(path)
     }
 
     fn read_to_string(&self, path: &std::path::Path) -> tylsmdb::Result<String> {
