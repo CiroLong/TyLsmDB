@@ -1,4 +1,7 @@
 pub mod file;
 pub mod fs;
 
-pub use fs::{read_current, set_current};
+pub use fs::{
+    Env, FsEnv, WritableFile, WritableFileOptions, read_current, read_current_with_env,
+    set_current, set_current_with_env,
+};

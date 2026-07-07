@@ -1,7 +1,6 @@
-use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::Path;
 
+use crate::env::{Env, FsEnv, WritableFile, WritableFileOptions};
 use crate::error::Result;
 use crate::util::crc::crc32c;
 use crate::version::edit::VersionEdit;
@@ -10,26 +9,27 @@ use crate::wal::format::WalRecordType;
 
 #[derive(Debug)]
 pub struct ManifestWriter {
-    file: File,
+    file: Box<dyn WritableFile>,
 }
 
 impl ManifestWriter {
     pub fn create(path: impl AsRef<Path>) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .read(true)
-            .open(path)?;
+        let env = FsEnv;
+        Self::create_with_env(&env, path)
+    }
+
+    pub fn create_with_env(env: &dyn Env, path: impl AsRef<Path>) -> Result<Self> {
+        let file = env.open_writable(path.as_ref(), WritableFileOptions::create())?;
         Ok(Self { file })
     }
 
     pub fn append_to(path: impl AsRef<Path>) -> Result<Self> {
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(path)?;
+        let env = FsEnv;
+        Self::append_to_with_env(&env, path)
+    }
+
+    pub fn append_to_with_env(env: &dyn Env, path: impl AsRef<Path>) -> Result<Self> {
+        let file = env.open_writable(path.as_ref(), WritableFileOptions::append())?;
         Ok(Self { file })
     }
 

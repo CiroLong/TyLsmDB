@@ -2,7 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::env::file::{manifest_file_name, parse_manifest_number};
-use crate::env::{read_current, set_current};
+use crate::env::{read_current_with_env, set_current_with_env};
 use crate::error::{Error, Result};
 use crate::options::Options;
 use crate::version::edit::VersionEdit;
@@ -33,15 +33,16 @@ impl VersionSet {
 
     pub fn create(db_path: impl AsRef<Path>, options: Options) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
-        std::fs::create_dir_all(&db_path)?;
+        options.env.create_dir_all(&db_path)?;
         let manifest_number = 1;
         let manifest_name = manifest_file_name(manifest_number);
         let manifest_path = db_path.join(&manifest_name);
-        let mut manifest_writer = ManifestWriter::create(&manifest_path)?;
+        let mut manifest_writer =
+            ManifestWriter::create_with_env(options.env.as_ref(), &manifest_path)?;
         manifest_writer.append(&VersionEdit::NextFileNumber(2))?;
         manifest_writer.append(&VersionEdit::LogNumber(1))?;
         manifest_writer.append(&VersionEdit::LastSequence(0))?;
-        set_current(&db_path, &manifest_name)?;
+        set_current_with_env(options.env.as_ref(), &db_path, &manifest_name)?;
 
         Ok(Self {
             current: Arc::new(Version::new(options.max_levels)),
@@ -55,7 +56,7 @@ impl VersionSet {
 
     pub fn recover(db_path: impl AsRef<Path>, options: Options) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
-        let manifest_name = read_current(&db_path)?;
+        let manifest_name = read_current_with_env(options.env.as_ref(), &db_path)?;
         let manifest_number = parse_manifest_number(&manifest_name)
             .ok_or_else(|| Error::Corruption("CURRENT points to invalid manifest".to_string()))?;
         let manifest_path = db_path.join(&manifest_name);
@@ -73,7 +74,10 @@ impl VersionSet {
         for edit in reader.read_all()? {
             versions.apply_edit(edit)?;
         }
-        versions.manifest_writer = Some(ManifestWriter::append_to(&manifest_path)?);
+        versions.manifest_writer = Some(ManifestWriter::append_to_with_env(
+            options.env.as_ref(),
+            &manifest_path,
+        )?);
         Ok(versions)
     }
 

@@ -1,7 +1,6 @@
-use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::env::{Env, FsEnv, WritableFile, WritableFileOptions};
 use crate::error::Result;
 use crate::key::InternalKey;
 use crate::memtable::ValueRecord;
@@ -17,7 +16,7 @@ use crate::util::crc::crc32c;
 #[derive(Debug)]
 pub struct SSTableBuilder {
     path: PathBuf,
-    file: File,
+    file: Box<dyn WritableFile>,
     offset: u64,
     block_size: usize,
     current_block: BlockBuilder,
@@ -47,12 +46,18 @@ impl SSTableBuilder {
         block_size: usize,
         compression: CompressionType,
     ) -> Result<Self> {
+        let env = FsEnv;
+        Self::create_with_env(&env, path, block_size, compression)
+    }
+
+    pub fn create_with_env(
+        env: &dyn Env,
+        path: impl AsRef<Path>,
+        block_size: usize,
+        compression: CompressionType,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&path)?;
+        let file = env.open_writable(&path, WritableFileOptions::create())?;
         Ok(Self {
             path,
             file,

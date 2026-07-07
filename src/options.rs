@@ -1,5 +1,7 @@
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::env::{Env, FsEnv};
 use crate::memtable::MemTableKind;
 use crate::snapshot::Snapshot;
 use crate::table::format::CompressionType;
@@ -35,6 +37,7 @@ pub struct Options {
     pub table_compression: CompressionType,
     pub write_rate_limit_bytes_per_sec: Option<u64>,
     pub write_group_max_delay: Duration,
+    pub env: Arc<dyn Env>,
 }
 
 impl Default for Options {
@@ -63,6 +66,7 @@ impl Default for Options {
             table_compression: CompressionType::None,
             write_rate_limit_bytes_per_sec: None,
             write_group_max_delay: Duration::from_micros(250),
+            env: Arc::new(FsEnv),
         }
     }
 }

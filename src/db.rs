@@ -127,22 +127,23 @@ struct GroupWriteItem {
 impl DB {
     pub fn open(path: impl AsRef<Path>, options: Options) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if path.exists() && options.error_if_exists {
+        let env = Arc::clone(&options.env);
+        if env.exists(&path) && options.error_if_exists {
             return Err(Error::InvalidArgument(format!(
                 "database already exists: {}",
                 path.display()
             )));
         }
-        if !path.exists() && !options.create_if_missing {
+        if !env.exists(&path) && !options.create_if_missing {
             return Err(Error::InvalidArgument(format!(
                 "database does not exist: {}",
                 path.display()
             )));
         }
-        std::fs::create_dir_all(&path)?;
+        env.create_dir_all(&path)?;
 
         let options_for_versions = options.clone();
-        let versions = if path.join("CURRENT").exists() {
+        let versions = if env.exists(&path.join("CURRENT")) {
             VersionSet::recover(&path, options_for_versions)?
         } else {
             VersionSet::create(&path, options_for_versions)?
@@ -164,7 +165,7 @@ impl DB {
         if wal_path.exists() {
             recover_wal(&wal_path, &mut state)?;
         }
-        let wal = WalWriter::create(&wal_path)?;
+        let wal = WalWriter::create_with_env(env.as_ref(), &wal_path)?;
         let write_rate_limiter = options.write_rate_limit_bytes_per_sec.map(RateLimiter::new);
 
         Ok(Self {
@@ -481,7 +482,10 @@ impl DB {
         let file_number = self.allocate_file_number()?;
         match self.write_l0_table(&memtable, file_number) {
             Ok((reader, meta)) => {
-                self.publish_l0_table(meta.clone(), state.last_sequence)?;
+                if let Err(err) = self.publish_l0_table(meta.clone(), state.last_sequence) {
+                    restore_flush_memtable(&mut state, memtable, source);
+                    return Err(err);
+                }
                 state.l0_tables.insert(0, (meta, reader));
                 Ok(())
             }
@@ -687,7 +691,8 @@ impl DB {
                 final_path.display()
             )));
         }
-        let mut builder = SSTableBuilder::create_with_compression(
+        let mut builder = SSTableBuilder::create_with_env(
+            self.inner.options.env.as_ref(),
             &tmp_path,
             self.inner.options.block_size,
             self.inner.options.table_compression,
@@ -696,8 +701,8 @@ impl DB {
             builder.add(key, &value)?;
         }
         builder.finish()?;
-        std::fs::rename(&tmp_path, &final_path)?;
-        let file_size = std::fs::metadata(&final_path)?.len();
+        self.inner.options.env.rename(&tmp_path, &final_path)?;
+        let file_size = self.inner.options.env.metadata_len(&final_path)?;
         self.inner.metrics.record_sst_write(file_size);
         let reader = self
             .inner
@@ -715,7 +720,7 @@ impl DB {
 
             let new_log_number = versions.allocate_file_number();
             let wal_path = self.inner.path.join(wal_file_name(new_log_number));
-            let new_wal = WalWriter::create(&wal_path)?;
+            let new_wal = WalWriter::create_with_env(self.inner.options.env.as_ref(), &wal_path)?;
             versions.log_and_apply(VersionEdit::LogNumber(new_log_number))?;
             new_wal
         };
@@ -986,7 +991,8 @@ impl DB {
         let table_name = table_file_name(file_number);
         let tmp_path = self.inner.path.join(format!("{table_name}.tmp"));
         let final_path = self.inner.path.join(table_name);
-        let mut builder = SSTableBuilder::create_with_compression(
+        let mut builder = SSTableBuilder::create_with_env(
+            self.inner.options.env.as_ref(),
             &tmp_path,
             self.inner.options.block_size,
             self.inner.options.table_compression,
@@ -995,8 +1001,8 @@ impl DB {
             builder.add(key, &value)?;
         }
         builder.finish()?;
-        std::fs::rename(&tmp_path, &final_path)?;
-        let file_size = std::fs::metadata(&final_path)?.len();
+        self.inner.options.env.rename(&tmp_path, &final_path)?;
+        let file_size = self.inner.options.env.metadata_len(&final_path)?;
         self.inner.metrics.record_sst_write(file_size);
         self.inner.metrics.record_compaction_write(file_size);
         let reader = self
@@ -1020,10 +1026,10 @@ impl DB {
     fn delete_obsolete_files(&self, numbers: impl IntoIterator<Item = u64>) -> Result<()> {
         for number in numbers {
             let path = self.inner.path.join(table_file_name(number));
-            match std::fs::remove_file(&path) {
+            match self.inner.options.env.remove_file(&path) {
                 Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
+                Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
             }
         }
         Ok(())
