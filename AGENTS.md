@@ -6,7 +6,7 @@
 
 `tylsmdb` 是一个基于 LSM tree 的 Rust 2024 嵌入式 key-value 存储引擎。它是 library crate，`src/main.rs` 里有一个很小的示例二进制；它不是网络数据库服务。公开 API 从 `src/lib.rs` 导出，核心类型包括 `DB`、`Options`、`ReadOptions`、`WriteOptions`、`WriteBatch`、`Snapshot`、`Transaction` 和 `MetricsSnapshot`。
 
-设计文档在 `docs/` 下。`docs/lsm_kv_design.md` 描述目标中的 LevelDB/RocksDB 风格架构，`docs/implementation/README.md` 记录 V0 到 V8 的实现里程碑。当前代码已经包含 V8 阶段的主要能力：WAL recovery、SSTable flush、VersionSet/MANIFEST、带 cache 的读路径、leveled compaction、MVCC snapshot/transaction、compression、skiplist memtable、group commit、subcompaction、metrics，以及 crash-recovery 加固测试。
+文档在 `docs/` 下。`docs/roadmap.md` 描述当前目标路线、已完成能力和后续方向，`docs/usage.md` 记录面向 crate 用户的 API 使用说明。当前代码已经包含主要能力：WAL recovery、SSTable flush、VersionSet/MANIFEST、带 cache 的读路径、streaming scan iterator、leveled compaction、MVCC snapshot/transaction、compression、skiplist memtable、group commit、subcompaction、metrics，以及 crash-recovery 加固测试。
 
 高层模块分工：
 
