@@ -3,10 +3,9 @@ use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
 
 use tylsmdb::env::file::table_file_name;
-use tylsmdb::iterator::{DBIterator, EntryIterator};
 use tylsmdb::key::{InternalKey, ValueType};
 use tylsmdb::memtable::ValueRecord;
-use tylsmdb::table::{SSTableBuilder, SSTableReader};
+use tylsmdb::table::SSTableBuilder;
 use tylsmdb::version::{FileMeta, VersionEdit, VersionSet};
 use tylsmdb::{DB, Options, ReadOptions};
 
@@ -15,31 +14,6 @@ fn fresh_dir(name: &str) -> PathBuf {
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(&path).expect("create fresh test dir");
     path
-}
-
-#[test]
-fn db_iterator_filters_old_versions_and_tombstones() {
-    let entries = vec![
-        put(b"a", 5, b"new"),
-        put(b"a", 2, b"old"),
-        del(b"b", 4),
-        put(b"b", 1, b"hidden"),
-        put(b"c", 3, b"visible"),
-    ];
-    let mut iter = DBIterator::new(
-        Box::new(EntryIterator::new(entries)),
-        Included(b"a".to_vec()),
-        Excluded(b"d".to_vec()),
-        5,
-    );
-
-    assert_eq!(
-        iter.collect().expect("collect visible rows"),
-        vec![
-            (b"a".to_vec(), b"new".to_vec()),
-            (b"c".to_vec(), b"visible".to_vec())
-        ]
-    );
 }
 
 #[test]
@@ -105,29 +79,6 @@ fn scan_merges_memtables_l0_and_levels() {
             (b"c".to_vec(), b"mem-c".to_vec())
         ]
     );
-}
-
-#[test]
-fn bloom_filter_has_no_false_negatives() {
-    let path = fresh_dir("bloom_filter_has_no_false_negatives").join("000007.sst");
-    let keys = [b"alpha".as_slice(), b"beta".as_slice(), b"gamma".as_slice()];
-    build_table(
-        &path,
-        keys.iter()
-            .enumerate()
-            .map(|(index, key)| put(key, (index + 1) as u64, b"value"))
-            .collect(),
-    );
-
-    let reader = SSTableReader::open(&path).expect("open table");
-
-    for key in keys {
-        assert!(reader.might_contain(key), "filter must not hide {key:?}");
-        assert_eq!(
-            reader.get(key, 10).expect("get filtered key"),
-            Some(ValueRecord::Put(b"value".to_vec()))
-        );
-    }
 }
 
 #[test]
@@ -252,12 +203,5 @@ fn put(key: &[u8], sequence: u64, value: &[u8]) -> (InternalKey, ValueRecord) {
     (
         InternalKey::new(key.to_vec(), sequence, ValueType::Put),
         ValueRecord::Put(value.to_vec()),
-    )
-}
-
-fn del(key: &[u8], sequence: u64) -> (InternalKey, ValueRecord) {
-    (
-        InternalKey::new(key.to_vec(), sequence, ValueType::Delete),
-        ValueRecord::Delete,
     )
 }

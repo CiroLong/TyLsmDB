@@ -4,103 +4,13 @@ use std::ops::Bound::Unbounded;
 use std::path::{Path, PathBuf};
 
 use tylsmdb::options::{WalSyncMode, WriteOptions};
-use tylsmdb::util::coding::{get_var_u64, put_var_u64};
-use tylsmdb::wal::{WalReader, WalWriter};
-use tylsmdb::{BatchRecord, DB, Error, Options, WriteBatch};
+use tylsmdb::{DB, Error, Options, WriteBatch};
 
 fn fresh_dir(name: &str) -> PathBuf {
     let path = PathBuf::from("target/tylsmdb-tests").join(name);
     let _ = fs::remove_dir_all(&path);
     fs::create_dir_all(&path).expect("create fresh test dir");
     path
-}
-
-#[test]
-fn varint_u64_roundtrips_common_boundaries() {
-    for value in [0, 1, 127, 128, 16_384, u64::MAX] {
-        let mut encoded = Vec::new();
-        put_var_u64(&mut encoded, value);
-        let mut input = encoded.as_slice();
-        assert_eq!(get_var_u64(&mut input).expect("decode varint"), value);
-        assert!(input.is_empty());
-    }
-}
-
-#[test]
-fn write_batch_payload_roundtrips_with_start_sequence() {
-    let mut batch = WriteBatch::new();
-    batch.put(b"a".to_vec(), b"1".to_vec());
-    batch.delete(b"b".to_vec());
-
-    let payload = batch.encode_with_sequence(42);
-    let (start_sequence, decoded) = WriteBatch::decode_payload(&payload).expect("decode payload");
-
-    assert_eq!(start_sequence, 42);
-    assert_eq!(decoded.records(), batch.records());
-    assert_eq!(
-        decoded.records(),
-        &[
-            BatchRecord::Put {
-                key: b"a".to_vec(),
-                value: b"1".to_vec()
-            },
-            BatchRecord::Delete { key: b"b".to_vec() }
-        ]
-    );
-}
-
-#[test]
-fn wal_writer_reader_roundtrips_payloads() {
-    let dir = fresh_dir("wal_writer_reader_roundtrips_payloads");
-    let path = dir.join("000001.wal");
-
-    let mut writer = WalWriter::create(&path).expect("create wal");
-    writer.append(b"first").expect("append first");
-    writer.append(b"second").expect("append second");
-    writer.sync().expect("sync wal");
-
-    let mut reader = WalReader::open(&path).expect("open reader");
-    assert_eq!(
-        reader.read_record().expect("read first"),
-        Some(b"first".to_vec())
-    );
-    assert_eq!(
-        reader.read_record().expect("read second"),
-        Some(b"second".to_vec())
-    );
-    assert_eq!(reader.read_record().expect("read eof"), None);
-}
-
-#[test]
-fn wal_reader_ignores_trailing_partial_record() {
-    let dir = fresh_dir("wal_reader_ignores_trailing_partial_record");
-    let path = dir.join("000001.wal");
-
-    let mut writer = WalWriter::create(&path).expect("create wal");
-    writer.append(b"complete").expect("append complete");
-    writer.sync().expect("sync wal");
-    append_bytes(&path, &[1, 2, 3, 4]);
-
-    let mut reader = WalReader::open(&path).expect("open reader");
-    assert_eq!(
-        reader.read_record().expect("read complete"),
-        Some(b"complete".to_vec())
-    );
-    assert_eq!(reader.read_record().expect("partial is eof"), None);
-}
-
-#[test]
-fn wal_reader_rejects_corrupt_complete_record() {
-    let dir = fresh_dir("wal_reader_rejects_corrupt_complete_record");
-    let path = dir.join("000001.wal");
-
-    let mut writer = WalWriter::create(&path).expect("create wal");
-    writer.append(b"payload").expect("append payload");
-    writer.sync().expect("sync wal");
-    corrupt_first_byte(&path);
-
-    let mut reader = WalReader::open(&path).expect("open reader");
-    assert!(matches!(reader.read_record(), Err(Error::Corruption(_))));
 }
 
 #[test]

@@ -187,3 +187,7 @@ fn file_overlaps_range(file: &FileMeta, lower: &Bound<&[u8]>, upper: &Bound<&[u8
     };
     lower_ok && upper_ok
 }
+
+#[cfg(test)]
+#[path = "picker_tests.rs"]
+mod tests;

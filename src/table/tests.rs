@@ -1,11 +1,10 @@
 use std::fs;
-use std::ops::Bound::{Excluded, Included, Unbounded};
 use std::path::{Path, PathBuf};
 
-use tylsmdb::key::{InternalKey, ValueType};
-use tylsmdb::memtable::ValueRecord;
-use tylsmdb::table::{BlockBuilder, BlockIterator, SSTableBuilder, SSTableReader};
-use tylsmdb::{DB, Options};
+use crate::key::{InternalKey, ValueType};
+use crate::memtable::ValueRecord;
+
+use super::{BlockBuilder, BlockIterator, SSTableBuilder, SSTableReader};
 
 fn fresh_dir(name: &str) -> PathBuf {
     let path = PathBuf::from("target/tylsmdb-tests").join(name);
@@ -102,70 +101,26 @@ fn reader_rejects_corrupt_block_checksum() {
 }
 
 #[test]
-fn flush_moves_memtable_to_l0_table_and_get_reads_from_flushed_table() {
-    let path = fresh_dir("flush_moves_memtable_to_l0_table_and_get_reads_from_flushed_table");
-    let db = DB::open(&path, Options::default()).expect("open db");
-
-    db.put(b"a", b"1").expect("put a");
-    db.put(b"b", b"2").expect("put b");
-    db.flush().expect("flush");
-
-    assert_eq!(db.get(b"a").expect("get flushed a"), Some(b"1".to_vec()));
-    assert_eq!(db.get(b"b").expect("get flushed b"), Some(b"2".to_vec()));
-    assert_eq!(sst_files(&path).len(), 1);
-}
-
-#[test]
-fn size_triggered_flush_writes_l0_table() {
-    let path = fresh_dir("size_triggered_flush_writes_l0_table");
-    let db = DB::open(
+fn bloom_filter_has_no_false_negatives() {
+    let path = fresh_dir("bloom_filter_has_no_false_negatives").join("000007.sst");
+    let keys = [b"alpha".as_slice(), b"beta".as_slice(), b"gamma".as_slice()];
+    build_table(
         &path,
-        Options {
-            memtable_size: 1,
-            ..Options::default()
-        },
-    )
-    .expect("open db");
-
-    db.put(b"auto", b"flush").expect("put auto flush");
-
-    assert_eq!(
-        db.get(b"auto").expect("get auto flushed"),
-        Some(b"flush".to_vec())
-    );
-    assert_eq!(sst_files(&path).len(), 1);
-}
-
-#[test]
-fn scan_merges_memtable_and_table_versions() {
-    let path = fresh_dir("scan_merges_memtable_and_table_versions");
-    let db = DB::open(&path, Options::default()).expect("open db");
-
-    db.put(b"a", b"old").expect("put old a");
-    db.put(b"b", b"table").expect("put b");
-    db.flush().expect("flush table");
-    db.put(b"a", b"new").expect("put new a");
-    db.delete(b"b").expect("delete b");
-    db.put(b"c", b"mem").expect("put c");
-
-    let rows = db
-        .scan(Included(b"a".as_slice()), Excluded(b"d".as_slice()))
-        .expect("scan merged");
-    assert_eq!(
-        rows,
-        vec![
-            (b"a".to_vec(), b"new".to_vec()),
-            (b"c".to_vec(), b"mem".to_vec())
-        ]
+        keys.iter()
+            .enumerate()
+            .map(|(index, key)| put(key, (index + 1) as u64, b"value"))
+            .collect(),
     );
 
-    assert_eq!(
-        db.scan(Unbounded, Unbounded).expect("scan all"),
-        vec![
-            (b"a".to_vec(), b"new".to_vec()),
-            (b"c".to_vec(), b"mem".to_vec())
-        ]
-    );
+    let reader = SSTableReader::open(&path).expect("open table");
+
+    for key in keys {
+        assert!(reader.might_contain(key), "filter must not hide {key:?}");
+        assert_eq!(
+            reader.get(key, 10).expect("get filtered key"),
+            Some(ValueRecord::Put(b"value".to_vec()))
+        );
+    }
 }
 
 fn build_sample_table(path: &Path) {
@@ -197,12 +152,18 @@ fn build_sample_table(path: &Path) {
     builder.finish().expect("finish table");
 }
 
-fn sst_files(path: &Path) -> Vec<PathBuf> {
-    let mut files: Vec<_> = fs::read_dir(path)
-        .expect("read db dir")
-        .map(|entry| entry.expect("dir entry").path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "sst"))
-        .collect();
-    files.sort();
-    files
+fn build_table(path: &Path, mut entries: Vec<(InternalKey, ValueRecord)>) {
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let mut builder = SSTableBuilder::create(path, 64).expect("create builder");
+    for (key, value) in entries {
+        builder.add(key, &value).expect("add entry");
+    }
+    builder.finish().expect("finish table");
+}
+
+fn put(key: &[u8], sequence: u64, value: &[u8]) -> (InternalKey, ValueRecord) {
+    (
+        InternalKey::new(key.to_vec(), sequence, ValueType::Put),
+        ValueRecord::Put(value.to_vec()),
+    )
 }

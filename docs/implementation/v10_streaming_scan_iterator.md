@@ -37,7 +37,7 @@
 - 修改：`src/db.rs`
 - 修改：`src/iterator/db_iterator.rs`
 - 修改：`src/table/reader.rs`
-- 新增：`tests/v10_streaming_scan_iterator.rs`
+- 新增：`tests/streaming_scan_iterator.rs`
 - 修改：`docs/implementation/README.md`
 - 修改：`docs/usage.md`
 - 修改：`README.md`
@@ -46,7 +46,7 @@
 
 - [x] **步骤 1：增加公开 scan iterator API 的红灯测试**
 
-  新增 `tests/v10_streaming_scan_iterator.rs`，先写测试：
+  新增 `tests/streaming_scan_iterator.rs`，先写测试：
 
   - `scan_iter_returns_visible_rows_incrementally`
   - `scan_iter_snapshot_preserves_old_versions`
@@ -105,7 +105,7 @@
   运行：
 
   ```bash
-  cargo test --test v10_streaming_scan_iterator
+  cargo test --test streaming_scan_iterator
   cargo test --all-targets
   cargo clippy --all-targets -- -D warnings
   cargo fmt --check

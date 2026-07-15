@@ -101,3 +101,7 @@ impl WriteBatch {
         Ok((start_sequence, batch))
     }
 }
+
+#[cfg(test)]
+#[path = "batch_tests.rs"]
+mod tests;

@@ -16,7 +16,7 @@ fn fresh_dir(name: &str) -> PathBuf {
 #[test]
 fn scan_iter_returns_visible_rows_incrementally() -> Result<()> {
     let db = DB::open(
-        fresh_dir("v10_scan_iter_returns_visible_rows_incrementally"),
+        fresh_dir("scan_iter_returns_visible_rows_incrementally"),
         Options::default(),
     )?;
 
@@ -50,7 +50,7 @@ fn scan_iter_returns_visible_rows_incrementally() -> Result<()> {
 #[test]
 fn scan_iter_snapshot_preserves_old_versions() -> Result<()> {
     let db = DB::open(
-        fresh_dir("v10_scan_iter_snapshot_preserves_old_versions"),
+        fresh_dir("scan_iter_snapshot_preserves_old_versions"),
         Options::default(),
     )?;
 
@@ -74,7 +74,7 @@ fn scan_iter_snapshot_preserves_old_versions() -> Result<()> {
 #[test]
 fn scan_iter_lower_bound_does_not_load_all_prefix_blocks() -> Result<()> {
     let db = DB::open(
-        fresh_dir("v10_scan_iter_lower_bound_does_not_load_all_prefix_blocks"),
+        fresh_dir("scan_iter_lower_bound_does_not_load_all_prefix_blocks"),
         Options {
             block_size: 96,
             ..Options::default()
@@ -106,7 +106,7 @@ fn scan_iter_lower_bound_does_not_load_all_prefix_blocks() -> Result<()> {
 #[test]
 fn scan_iter_fill_cache_false_does_not_touch_block_cache() -> Result<()> {
     let db = DB::open(
-        fresh_dir("v10_scan_iter_fill_cache_false_does_not_touch_block_cache"),
+        fresh_dir("scan_iter_fill_cache_false_does_not_touch_block_cache"),
         Options {
             block_size: 96,
             ..Options::default()

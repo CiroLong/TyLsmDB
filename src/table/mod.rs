@@ -11,3 +11,6 @@ pub use block_builder::BlockBuilder;
 pub use block_iterator::BlockIterator;
 pub use builder::SSTableBuilder;
 pub use reader::{SSTableReader, TableIterator};
+
+#[cfg(test)]
+mod tests;

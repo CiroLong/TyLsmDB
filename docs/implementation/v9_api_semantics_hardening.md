@@ -37,7 +37,7 @@
 - 修改：`src/table/reader.rs`
 - 修改：`src/cache/table_cache.rs`
 - 修改：`src/db.rs`
-- 修改：`tests/v5_read_path_cache.rs`
+- 修改：`tests/read_path_cache.rs`
 - 修改：`tests/crash_recovery.rs`
 - 修改：`docs/usage.md`
 - 修改：`docs/implementation/README.md`
@@ -46,7 +46,7 @@
 
 - [x] **步骤 1：增加 `scan_opt` cache 语义回归测试**
 
-  在 `tests/v5_read_path_cache.rs` 中增加测试：
+  在 `tests/read_path_cache.rs` 中增加测试：
 
   - 构造带 SSTable 的 DB。
   - 第一次 `scan_opt(..., ReadOptions { fill_cache: false, .. })` 后断言 block cache hit/miss 不增加。

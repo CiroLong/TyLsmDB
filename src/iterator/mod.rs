@@ -9,3 +9,6 @@ pub use db_iterator::DBIterator;
 pub use merge_iterator::MergeIterator;
 pub use storage_iterator::{EntryIterator, StorageIterator};
 pub use two_merge_iterator::TwoMergeIterator;
+
+#[cfg(test)]
+mod tests;

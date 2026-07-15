@@ -4,3 +4,6 @@ pub mod writer;
 
 pub use reader::WalReader;
 pub use writer::WalWriter;
+
+#[cfg(test)]
+mod tests;

@@ -48,3 +48,7 @@ impl RateLimiter {
         state.last_refill.saturating_duration_since(now)
     }
 }
+
+#[cfg(test)]
+#[path = "rate_limiter_tests.rs"]
+mod tests;

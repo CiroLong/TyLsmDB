@@ -70,18 +70,19 @@
 
 ## 测试
 
-测试主要由 integration tests 驱动，部分模块内也有聚焦的 unit tests。
+测试分为源码模块 unit tests 和 `tests/` 下的 integration tests。模块 UT 单独放在对应源码模块旁边，例如 `src/*_tests.rs`、`src/*/tests.rs` 或 `src/*/*_tests.rs`，覆盖 batch、key、memtable、WAL、table、version、env、iterator、compact picker、MVCC watermark、coding 和 rate limiter 等模块。
 
-integration tests 按功能里程碑组织：
+integration tests 按功能模块组织：
 
-- `tests/v0_v1.rs`：公开 API 形状、internal key ordering、内存态 put/get/delete/scan 行为。
-- `tests/v2_wal_recovery.rs`：varint/batch 编码、WAL reader/writer、partial/corrupt WAL 处理、reopen recovery。
-- `tests/v3_sstable_flush.rs`：block prefix compression、SSTable roundtrip/checksum、memtable flush、scan merging。
-- `tests/v4_versions_manifest.rs`：MANIFEST/CURRENT 处理、version replay、file-number preservation、跨 SST/WAL recovery。
-- `tests/v5_read_path_cache.rs`：DB iterator visibility、L0/lower-level read 行为、Bloom filter、block cache stats。
-- `tests/v6_leveled_compaction_gc.rs`：compaction picking/execution、level file counts、GC 行为。
-- `tests/v7_mvcc_transactions.rs`：snapshot、基于 watermark 的 GC、原子 transaction commit、rollback、write/write 和 read/write conflict、phantom range conflict。
-- `tests/v8_optimization_hardening.rs`：skiplist memtable parity、zstd table compression、metrics、group commit、rate limiter、subcompaction。
+- `tests/api_in_memory.rs`：公开 API 形状、内存态 put/get/delete/scan 行为。
+- `tests/wal_recovery.rs`：DB WAL replay、per-write sync、partial/corrupt WAL 的 open/recovery 行为。
+- `tests/table_flush.rs`：memtable flush、L0 SSTable 读取、scan 合并 memtable/table 版本。
+- `tests/version_manifest.rs`：跨 SST/WAL recovery、file-number preservation、CURRENT 存在性。
+- `tests/read_path_cache.rs`：L0/lower-level read 行为、scan merging、block cache stats。
+- `tests/compaction_gc.rs`：compaction execution、level file counts、GC 行为。
+- `tests/mvcc_transactions.rs`：snapshot、基于 watermark 的 GC、原子 transaction commit、rollback、write/write 和 read/write conflict、phantom range conflict。
+- `tests/optimization_hardening.rs`：skiplist memtable parity、zstd table compression、metrics、group commit、rate limiter、subcompaction。
+- `tests/streaming_scan_iterator.rs`：公开 `scan_iter` API、SSTable 按 block 懒加载 scan、兼容旧 `scan`。
 - `tests/model_kv.rs`：deterministic 和 proptest operation streams，对照 `BTreeMap` oracle。
 - `tests/crash_recovery.rs`：通过自定义 `Env` 注入 WAL/SST/MANIFEST/CURRENT 故障。
 - `tests/fuzz_target.rs` 和 `src/bin/fuzz_model.rs`：基于紧凑 operation bytes 的 binary fuzz/model harness。
@@ -89,12 +90,12 @@ integration tests 按功能里程碑组织：
 常用聚焦命令：
 
 - `cargo test put_get_and_delete_work_in_memory`
-- `cargo test --test v7_mvcc_transactions`
+- `cargo test --test mvcc_transactions`
 - `cargo test --test crash_recovery`
 - `cargo test --test model_kv random_operations_match_btreemap_oracle`
 - `cargo bench --bench write_read`
 
-修改 persistence 或 recovery 时，至少运行 WAL、SSTable、manifest、model 和 crash-recovery 相关测试。修改 visibility/sequence 逻辑时，包含 MVCC transaction tests 和 model tests。修改 read path caching 时，包含 `v5_read_path_cache` 和 `v8_optimization_hardening`。
+修改 persistence 或 recovery 时，至少运行 WAL、SSTable、manifest、model 和 crash-recovery 相关测试。修改 visibility/sequence 逻辑时，包含 MVCC transaction tests 和 model tests。修改 read path caching 时，包含 `read_path_cache` 和 `optimization_hardening`。
 
 ## 安全与数据保护
 

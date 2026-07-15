@@ -8,3 +8,6 @@ pub use edit::VersionEdit;
 pub use manifest::{ManifestReader, ManifestWriter};
 pub use version::{FileMeta, Version};
 pub use version_set::VersionSet;
+
+#[cfg(test)]
+mod tests;

@@ -193,19 +193,6 @@ fn group_commit_batches_concurrent_sync_writes() {
 }
 
 #[test]
-fn rate_limiter_reports_wait_when_budget_is_exhausted() {
-    let limiter = tylsmdb::util::rate_limiter::RateLimiter::new(10);
-
-    assert_eq!(limiter.reserve(4), std::time::Duration::ZERO);
-    assert!(limiter.reserve(20) > std::time::Duration::ZERO);
-
-    let limiter = tylsmdb::util::rate_limiter::RateLimiter::new(10);
-    let first_wait = limiter.reserve(30);
-    let second_wait = limiter.reserve(10);
-    assert!(second_wait > first_wait);
-}
-
-#[test]
 fn parallel_subcompaction_records_multiple_tasks_and_keeps_sorted_results() {
     let path = fresh_dir("manual_compaction_with_small_subcompaction_budget");
     let db = DB::open(
